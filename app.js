@@ -3,7 +3,7 @@
 
 const CFG = window.HANDOVER_CONFIG || {};
 const DEMO = !(CFG.firebase && CFG.firebase.apiKey) || !!CFG.forceDemo;
-const APP_VERSION = '3.3.1';
+const APP_VERSION = '3.4.0';
 
 /* ---------------- small helpers ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -1588,7 +1588,7 @@ function openMenu() {
         ${drive ? item('drive-now', 'cloud', 'Save to Google Drive now', S.sheet.archivedAt ? 'Last saved ' + fmtTime(S.sheet.archivedAt) : 'Not saved to Drive yet') : ''}
       </div>` : ''}
       <div class="menu-group">Bring a sheet in</div><div class="menu-list">
-        ${item('import', 'upload', 'Import edited DOCX', 'A sheet edited on a computer or received on WhatsApp')}
+        ${item('import', 'upload', 'Import Word file (.docx or .doc)', 'A sheet edited on a computer or received on WhatsApp')}
       </div>
       <div class="menu-group">Find and review</div><div class="menu-list">
         ${item('search-all', 'search', 'Search all days', 'Any patient, UHID, diagnosis or drug')}
@@ -1633,6 +1633,7 @@ function parsePara(p) {
         if (t.nodeType !== 1) return;
         if (t.localName === 't') runs.push({ ...fmt, text: t.textContent });
         else if (t.localName === 'tab') runs.push({ ...fmt, text: ' ' });
+        else if (t.localName === 'sym') { const ch = symChar(wAttr(t, 'font'), parseInt(wAttr(t, 'char') || '0', 16)); if (ch) runs.push({ ...fmt, text: ch }); }
         else if (t.localName === 'br' || t.localName === 'cr') runs.push({ br: true });
       });
     });
@@ -1679,7 +1680,7 @@ function parseHeaderLine(text) {
 function nameKey(n) { return String(n || '').toUpperCase().replace(/\b(MST|MSS|MD|MOHAMMAD|MOHAMMED|MUHAMMAD|MRS|MR|MS|MISS|BABY|SK|SHEIKH)\b\.?/g, '').replace(/[^A-Z]/g, ''); }
 function firstToken(n) { return (String(n || '').toUpperCase().replace(/\b(MST|MD|MRS|MR|MS|MISS)\b\.?/g, '').match(/[A-Z]{2,}/) || [''])[0]; }
 function parseHandoverRow(cells) {
-  const L = cells.map(cellLines), T = i => trimBlank(L[i] || []).map(l => l.text.trim()).filter(Boolean);
+  const L = cells.map(c => Array.isArray(c) ? c : cellLines(c)), T =i => trimBlank(L[i] || []).map(l => l.text.trim()).filter(Boolean);
   if (L.length < 6) return null;
   const has8 = L.length >= 8;
   const bed = T(0).join('').replace(/\s+/g, '');
@@ -1692,9 +1693,12 @@ function parseHandoverRow(cells) {
     const k = o[1].toUpperCase(); outcome = /DISCH/.test(k) ? 'discharged' : /WARD/.test(k) ? 'ward' : /DAMA|LAMA/.test(k) ? 'dama' : /DEATH|DIED|EXPIRED/.test(k) ? 'death' : 'transfer';
     outcomeNote = (o[2] || '').trim(); return false;
   });
-  let nameAge = lines.join(' ').replace(/\s+/g, ' ').trim(), age = '';
-  const am = nameAge.match(/,?\s*(\d{1,3}(?:\.\d)?)\s*(YRS?|YEARS?|Y|MONTHS?|MTHS?|M|DAYS?|D)\b\.?\s*(?:OLD)?/i);
-  if (am) { age = /^Y/i.test(am[2]) ? am[1] : `${am[1]} ${am[2].toUpperCase()}`; nameAge = (nameAge.slice(0, am.index) + nameAge.slice(am.index + am[0].length)).trim(); }
+  const AGE_RX = /,?\s*(\d{1,3}(?:\.\d)?)\s*(YRS?|YEARS?|Y|MONTHS?|MTHS?|M|DAYS?|D)\b\.?\s*(?:OLD)?/i;
+  let nameAge = lines.join(' ').replace(/\s+/g, ' ').trim(), age = '', nameNote = '';
+  const ai = lines.findIndex(l => AGE_RX.test(l));
+  if (ai > 0 && ai < lines.length - 1) { nameNote = lines.slice(ai + 1).join(' ').replace(/\s+/g, ' ').trim(); nameAge = lines.slice(0, ai + 1).join(' ').replace(/\s+/g, ' ').trim(); }
+  const am = nameAge.match(AGE_RX);
+  if (am) { age = /^Y/i.test(am[2]) ? am[1] : `${am[1]} ${am[2].toUpperCase()}`; nameAge = (nameAge.slice(0, am.index) + ' ' + nameAge.slice(am.index + am[0].length)).replace(/\s+/g, ' ').trim(); }
   const name = nameAge.replace(/[,;\s]+$/, '').trim().toUpperCase();
   // dates and consultant
   const c2 = T(2); let doa = '', micu = ''; const cons = [];
@@ -1708,14 +1712,289 @@ function parseHandoverRow(cells) {
   return {
     bed, name, age, uhid, outcome, outcomeNote, doa, micuDate: micu || doa, consultant: cons.join(' ').toUpperCase(),
     diagnosis: linesHtml(dx), investigations: linesHtml(inv), source: T(4).join('').toUpperCase(),
-    history: linesHtml(hx), plan: linesHtml(plan), drugs: linesHtml(L[6] || []), referral: has8 ? T(7).join(', ').toUpperCase() : ''
+    history: linesHtml(hx), plan: (nameNote ? esc(nameNote) + (plan.length ? '<br>' : '') : '') + linesHtml(plan), drugs: linesHtml(L[6] || []), referral: has8 ? T(7).join(', ').toUpperCase() : ''
   };
+}
+/* ---------- old Word 97-2003 .doc files (binary) ---------- */
+// Reads the compound file, the piece table, table cell/row marks and direct
+// bold / italic / underline / colour / highlight. Pictures and styles are skipped.
+function cfbStreams(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const sec = 1 << dv.getUint16(0x1E, true), mini = 1 << dv.getUint16(0x20, true);
+  const cutoff = dv.getUint32(0x38, true);
+  const off = s => (s + 1) * sec;
+  // FAT from the DIFAT
+  const difat = [];
+  for (let i = 0; i < 109; i++) { const s = dv.getUint32(0x4C + i * 4, true); if (s < 0xFFFFFFFA) difat.push(s); }
+  let ds = dv.getUint32(0x44, true), nd = dv.getUint32(0x48, true);
+  while (nd-- > 0 && ds < 0xFFFFFFFA) { for (let i = 0; i < sec / 4 - 1; i++) { const s = dv.getUint32(off(ds) + i * 4, true); if (s < 0xFFFFFFFA) difat.push(s); } ds = dv.getUint32(off(ds) + sec - 4, true); }
+  const fat = []; difat.forEach(s => { for (let i = 0; i < sec / 4; i++) fat.push(dv.getUint32(off(s) + i * 4, true)); });
+  const chain = (start, table) => { const out = []; let s = start, guard = 0; while (s < 0xFFFFFFFA && guard++ < 1e6) { out.push(s); s = table[s]; } return out; };
+  const readBig = (start, size) => { const out = new Uint8Array(size); let p = 0; for (const s of chain(start, fat)) { const n = Math.min(sec, size - p); if (n <= 0) break; out.set(u8.subarray(off(s), off(s) + n), p); p += n; } return out; };
+  // directory
+  const dirBytes = readBig(dv.getUint32(0x30, true), chain(dv.getUint32(0x30, true), fat).length * sec);
+  const dd = new DataView(dirBytes.buffer);
+  const entries = [];
+  for (let o = 0; o + 128 <= dirBytes.length; o += 128) {
+    const nl = dd.getUint16(o + 0x40, true), type = dd.getUint8(o + 0x42);
+    if (!type) continue;
+    let name = ''; for (let i = 0; i < Math.max(0, nl / 2 - 1); i++) name += String.fromCharCode(dd.getUint16(o + i * 2, true));
+    entries.push({ name, type, start: dd.getUint32(o + 0x74, true), size: dd.getUint32(o + 0x78, true) });
+  }
+  const root = entries.find(e => e.type === 5);
+  let ministream = null, minifat = null;
+  const get = name => {
+    const e = entries.find(x => x.name === name && x.type === 2); if (!e) return null;
+    if (e.size >= cutoff) return readBig(e.start, e.size);
+    if (!ministream) {
+      ministream = readBig(root.start, root.size);
+      const mf = readBig(dv.getUint32(0x3C, true), dv.getUint32(0x40, true) * sec), mv = new DataView(mf.buffer);
+      minifat = []; for (let i = 0; i < mf.length / 4; i++) minifat.push(mv.getUint32(i * 4, true));
+    }
+    const out = new Uint8Array(e.size); let p = 0;
+    for (const s of chain(e.start, minifat)) { const n = Math.min(mini, e.size - p); if (n <= 0) break; out.set(ministream.subarray(s * mini, s * mini + n), p); p += n; }
+    return out;
+  };
+  return { get };
+}
+const SYM_MAP = {
+  symbol: { 0xAD: '↑', 0xAF: '↓', 0xAE: '→', 0xAC: '←', 0xAB: '↔', 0xDE: '⇒', 0xDC: '⇐', 0xDD: '⇑', 0xDF: '⇓', 0xDB: '⇔', 0xB3: '≥', 0xA3: '≤', 0xB1: '±', 0xB0: '°', 0xB4: '×', 0xB8: '÷', 0xBB: '≈', 0xB9: '≠', 0xD6: '√', 0xB7: '•', 0xA5: '∞', 0x61: 'α', 0x62: 'β', 0x67: 'γ', 0x64: 'δ', 0x44: 'Δ', 0x6D: 'μ', 0x6C: 'λ', 0x70: 'π', 0x73: 'σ', 0x71: 'θ', 0x2D: '−', 0xBE: '—' },
+  wingdings: { 0xDF: '←', 0xE0: '→', 0xE1: '↑', 0xE2: '↓', 0xE7: '⇦', 0xE8: '⇨', 0xE9: '⇧', 0xEA: '⇩', 0xF0: '⇨', 0xD8: '➢', 0xFC: '✓', 0xFB: '✗', 0xFD: '☒', 0xFE: '☑', 0xA8: '◻', 0x6F: '□', 0x6E: '■', 0x6C: '●', 0x9F: '•', 0xA7: '▪', 0x76: '❖', 0x71: '❑', 0x4A: '☺', 0x4C: '☹', 0x46: '☞' }
+};
+function symChar(font, code) {
+  const f = String(font || '').toLowerCase(), c = code & 0xFF;
+  const map = /wingdings/.test(f) && !/[23]/.test(f) ? SYM_MAP.wingdings : /symbol/.test(f) ? SYM_MAP.symbol : null;
+  return (map && map[c]) || (code >= 0xF000 || map ? '' : String.fromCharCode(code));
+}
+const ICO = [null, '000000', '0000FF', '00FFFF', '00FF00', 'FF00FF', 'FF0000', 'FFFF00', 'FFFFFF', '000080', '008080', '008000', '800080', '800000', '808000', '808080', 'C0C0C0'];
+function sprmList(bytes, from, to) {
+  const out = []; let p = from;
+  while (p + 2 <= to) {
+    const op = bytes[p] | (bytes[p + 1] << 8); p += 2;
+    const spra = op >> 13; let n;
+    if (spra === 0 || spra === 1) n = 1; else if (spra === 2 || spra === 4 || spra === 5) n = 2; else if (spra === 3) n = 4; else if (spra === 7) n = 3;
+    else if (op === 0xD608 || op === 0xD606) { n = (bytes[p] | (bytes[p + 1] << 8)) + 1; }
+    else { n = bytes[p] + 1; }
+    out.push({ op, at: p, n }); p += n;
+  }
+  return out;
+}
+function docFkpRuns(word, tbl, fc, lcb, kind, data) {
+  // returns [{a,b,props}] in file positions
+  const runs = []; if (!lcb) return runs;
+  const tv = new DataView(tbl.buffer, tbl.byteOffset, tbl.byteLength);
+  const n = (lcb - 4) / 8;
+  for (let i = 0; i < n; i++) {
+    const pn = tv.getUint32(fc + (n + 1) * 4 + i * 4, true) & 0x3FFFFF;
+    const base = pn * 512; if (base + 512 > word.length) continue;
+    const wv = new DataView(word.buffer, word.byteOffset + base, 512);
+    const crun = word[base + 511];
+    for (let k = 0; k < crun; k++) {
+      const a = wv.getUint32(k * 4, true), b = wv.getUint32((k + 1) * 4, true);
+      const props = {};
+      if (kind === 'chp') {
+        const bo = word[base + (crun + 1) * 4 + k] * 2;
+        if (bo) {
+          const cb = word[base + bo];
+          sprmList(word, base + bo + 1, base + bo + 1 + cb).forEach(({ op, at }) => {
+            const v = word[at];
+            if (op === 0x0835) props.b = v === 1 || v === 0x81;
+            else if (op === 0x0836) props.i = v === 1 || v === 0x81;
+            else if (op === 0x2A3E) props.u = v !== 0;
+            else if (op === 0x6A09) props.sym = [word[at] | (word[at + 1] << 8), word[at + 2] | (word[at + 3] << 8)];
+            else if (op === 0x0800) props.del = v === 1 || v === 0x81;   // deleted with track changes
+            else if (op === 0x083C) props.hidden = v === 1 || v === 0x81;
+            else if (op === 0x2A42) props.color = ICO[v] && ICO[v] !== '000000' ? ICO[v] : props.color || null;
+            else if (op === 0x6870) { if (!(word[at + 3] & 0xFF) && (word[at] | word[at + 1] | word[at + 2])) props.color = [word[at], word[at + 1], word[at + 2]].map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase(); else if (!(word[at] | word[at + 1] | word[at + 2])) props.color = null; }
+            else if (op === 0x2A0C) props.bg = ICO[v] && v !== 8 ? ICO[v] : null;
+            else if (op === 0xCA71) { const r = word[at + 5], g = word[at + 6], bl = word[at + 7], auto = word[at + 8]; if (!auto && !(r === 255 && g === 255 && bl === 255)) props.bg = props.bg || [r, g, bl].map(x => x.toString(16).padStart(2, '0')).join('').toUpperCase(); }
+          });
+        }
+      } else {
+        const bo = word[base + (crun + 1) * 4 + k * 13] * 2;
+        if (bo) {
+          let cb = word[base + bo], start = base + bo + 1;
+          if (!cb) { cb = word[start]; start++; cb = cb * 2; } else cb = cb * 2 - 1;
+          const look = (bytes, from, to, deep) => sprmList(bytes, from, to).forEach(({ op, at }) => {
+            if (op === 0x2417 && bytes[at]) props.ttp = true;      // end of a table row
+            if (op === 0x244C && bytes[at]) props.ttp = true;      // inner table row end
+            if (op === 0xD608) props.ttp = true;
+            if ((op === 0x2416 && bytes[at]) || (op === 0x6649 && (bytes[at] | bytes[at + 1]))) props.inTable = true;
+            // big table rows keep their properties in the Data stream
+            if (op === 0x6646 && deep && data) { const o = bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24); if (o >= 0 && o + 2 <= data.length) { const n = data[o] | (data[o + 1] << 8); look(data, o + 2, Math.min(data.length, o + 2 + n), false); } }
+          });
+          look(word, start + 2, start + cb, true);
+        }
+      }
+      runs.push({ a, b, props });
+    }
+  }
+  return runs.sort((x, y) => x.a - y.a);
+}
+function runAt(runs, fc) { let lo = 0, hi = runs.length - 1; while (lo <= hi) { const m = (lo + hi) >> 1; if (fc < runs[m].a) hi = m - 1; else if (fc >= runs[m].b) lo = m + 1; else return runs[m].props; } return {}; }
+const CP1252 = { 0x80: 0x20AC, 0x82: 0x201A, 0x83: 0x0192, 0x84: 0x201E, 0x85: 0x2026, 0x86: 0x2020, 0x87: 0x2021, 0x88: 0x02C6, 0x89: 0x2030, 0x8A: 0x0160, 0x8B: 0x2039, 0x8C: 0x0152, 0x8E: 0x017D, 0x91: 0x2018, 0x92: 0x2019, 0x93: 0x201C, 0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014, 0x98: 0x02DC, 0x99: 0x2122, 0x9A: 0x0161, 0x9B: 0x203A, 0x9C: 0x0153, 0x9E: 0x017E, 0x9F: 0x0178 };
+function readDocBinary(u8) {
+  const cfb = cfbStreams(u8);
+  const word = cfb.get('WordDocument'); if (!word) throw new Error('This .doc file could not be read.');
+  const wv = new DataView(word.buffer, word.byteOffset, word.byteLength);
+  if (wv.getUint16(0, true) !== 0xA5EC) throw new Error('This .doc file could not be read (very old Word version). Open it in Word and save it as .docx.');
+  const flags = wv.getUint16(0x0A, true);
+  if (flags & 0x0100) throw new Error('This .doc file has a password. Remove the password in Word and try again.');
+  const tbl = cfb.get(flags & 0x0200 ? '1Table' : '0Table'); if (!tbl) throw new Error('This .doc file could not be read.');
+  const csw = wv.getUint16(32, true), lwAt = 34 + csw * 2 + 2, cslw = wv.getUint16(34 + csw * 2, true);
+  const ccp = i => wv.getInt32(lwAt + i * 4, true);
+  const ccpText = ccp(3), ccpFtn = ccp(4), ccpHdd = ccp(5);
+  const fcAt = lwAt + cslw * 4 + 2;
+  const pair = i => [wv.getUint32(fcAt + i * 8, true), wv.getUint32(fcAt + i * 8 + 4, true)];
+  const [fcChp, lcbChp] = pair(12), [fcPap, lcbPap] = pair(13), [fcClx, lcbClx] = pair(33);
+  // piece table
+  const tv = new DataView(tbl.buffer, tbl.byteOffset, tbl.byteLength);
+  let p = fcClx, pcdt = -1;
+  while (p < fcClx + lcbClx) { if (tbl[p] === 1) p += 3 + tv.getUint16(p + 1, true); else if (tbl[p] === 2) { pcdt = p; break; } else break; }
+  if (pcdt < 0) throw new Error('This .doc file could not be read.');
+  const lcb = tv.getUint32(pcdt + 1, true), plc = pcdt + 5, npc = (lcb - 4) / 12;
+  const chars = []; // {c, fc}
+  for (let i = 0; i < npc; i++) {
+    const cpA = tv.getUint32(plc + i * 4, true), cpB = tv.getUint32(plc + (i + 1) * 4, true);
+    const raw = tv.getUint32(plc + (npc + 1) * 4 + i * 8 + 2, true), comp = !!(raw & 0x40000000), fc0 = raw & 0x3FFFFFFF;
+    for (let cp = cpA; cp < cpB; cp++) {
+      let code, fc;
+      if (comp) { fc = fc0 / 2 + (cp - cpA); code = word[fc]; code = CP1252[code] || code; }
+      else { fc = fc0 + 2 * (cp - cpA); code = word[fc] | (word[fc + 1] << 8); }
+      chars.push({ c: code, fc });
+    }
+  }
+  const dataSt = cfb.get('Data');
+  // font names (for Symbol / Wingdings characters)
+  const fonts = [];
+  try {
+    const [fcF, lcbF] = pair(15);
+    if (lcbF) { let q = fcF; const cData = tv.getUint16(q, true); q += 4; for (let i = 0; i < cData && q < fcF + lcbF; i++) { const cb = tbl[q]; let nm = ''; for (let k = q + 1 + 39; k + 1 < q + 1 + cb; k += 2) { const ch = tv.getUint16(k, true); if (!ch) break; nm += String.fromCharCode(ch); } fonts.push(nm); q += 1 + cb; } }
+  } catch {}
+  const chp = docFkpRuns(word, tbl, fcChp, lcbChp, 'chp'), pap = docFkpRuns(word, tbl, fcPap, lcbPap, 'pap', dataSt);
+  // walk text, drop field codes, keep field results
+  const story = (from, to) => {
+    const out = []; const stack = [];
+    for (let i = from; i < Math.min(to, chars.length); i++) {
+      const { c, fc } = chars[i];
+      if (c === 0x13) { stack.push(true); continue; }       // field start: hide code
+      if (c === 0x14) { if (stack.length) stack[stack.length - 1] = false; continue; } // show result
+      if (c === 0x15) { stack.pop(); continue; }
+      if (stack.some(Boolean)) continue;
+      const f = runAt(chp, fc); if (f.del && c !== 0x07 && c !== 0x0D) continue;
+      if (f.sym && c === 0x28) { const ch = symChar(fonts[f.sym[0]], f.sym[1]); if (ch) out.push({ c: ch.charCodeAt(0), fc, f }); continue; }
+      out.push({ c, fc, f });
+    }
+    return out;
+  };
+  return { main: story(0, ccpText), header: ccpHdd > 0 ? story(ccpText + ccpFtn, ccpText + ccpFtn + ccpHdd) : [], pap };
+}
+function docLine(seg) {
+  // seg: [{c,f}] → {text, html}
+  const runs = [];
+  seg.forEach(({ c, f }) => {
+    let ch;
+    if (c === 0x09) ch = ' '; else if (c === 0x1E) ch = '-'; else if (c === 0x1F || c < 0x20) return; else ch = String.fromCharCode(c);
+    const fmt = { b: !!f.b, i: !!f.i, u: !!f.u, color: f.color || null, bg: f.bg || null };
+    const last = runs[runs.length - 1];
+    if (last && last.b === fmt.b && last.i === fmt.i && last.u === fmt.u && last.color === fmt.color && last.bg === fmt.bg) last.text += ch; else runs.push({ ...fmt, text: ch });
+  });
+  const text = runs.map(r => r.text).join('');
+  const html = runs.map(s => { let h = esc(s.text); if (s.color) h = `<font color="#${s.color}">${h}</font>`; if (s.bg) h = `<span style="background-color:#${s.bg}">${h}</span>`; if (s.u) h = `<u>${h}</u>`; if (s.i) h = `<i>${h}</i>`; if (s.b) h = `<b>${h}</b>`; return h; }).join('');
+  return { text: text.replace(/ /g, ' '), html };
+}
+function docToLines(chs) { const lines = [[]]; chs.forEach(x => { if (x.c === 0x0D || x.c === 0x0B || x.c === 0x0C) lines.push([]); else lines[lines.length - 1].push(x); }); return lines.map(docLine); }
+function parseHandoverDoc(buf) {
+  const d = readDocBinary(new Uint8Array(buf));
+  // split main text into paragraphs; a paragraph ending in 0x07 is a cell end, or a row end when its paragraph props say so
+  const rows = [], before = []; let cells = [], cell = [], para = [], width = 0;
+  d.main.forEach(x => {
+    if (x.c === 0x07) {
+      const pp = runAt(d.pap, x.fc);
+      // row end: marked in the paragraph props, or (if Word did not mark it) a mark right after a full row
+      const ttp = pp.ttp || (!pp.inTable && width && cells.length >= width && !cell.length && !para.length);
+      if (ttp) { if (cell.length || para.length) { cell.push(...para); cells.push(cell); } if (cells.length) { rows.push(cells); width = width || cells.length; } cells = []; cell = []; para = []; return; }
+      cell.push(...para); cells.push(cell); cell = []; para = []; return;
+    }
+    para.push(x);
+    if (x.c === 0x0D) {
+      const pp = runAt(d.pap, x.fc);
+      if (pp.inTable || cells.length || cell.length) { cell.push(...para); para = []; }
+      else { if (!rows.length) before.push(...para); para = []; }
+    }
+  });
+  if (cells.length) rows.push(cells);
+  // fallback when row ends were not marked: cut by the most common width (8 or 7)
+  let table = rows;
+  if (table.length <= 1 && table[0] && table[0].length > 8) { const flat = table[0], w = flat.length % 9 === 0 ? 9 : 8; table = []; for (let i = 0; i < flat.length; i += w) table.push(flat.slice(i, i + w).slice(0, 8)); }
+  let head = null;
+  for (const l of docToLines(d.header)) { head = parseHeaderLine(l.text); if (head) break; }
+  if (!head) for (const l of docToLines(before)) { head = parseHeaderLine(l.text); if (head) break; }
+  const out = [];
+  table.forEach(cs => {
+    const r = parseHandoverRow(cs.map(docToLines));
+    if (!r || !r.name || /^NAME\b|^PATIENT/i.test(r.name)) return;
+    out.push(r);
+  });
+  if (!table.length) throw new Error('No table found. The file should have the handover table.');
+  if (!out.length) throw new Error('No patients found in the table.');
+  return { date: head ? head.date : '', shift: head ? head.shift : '', doctors: head ? head.doctors : '', rows: out };
+}
+/* ---------- Word saved as web page / RTF (some apps name these .doc) ---------- */
+function parseHandoverHtml(str) {
+  const dom = new DOMParser().parseFromString(str, 'text/html');
+  const lines = el => {
+    const out = [[]];
+    const walk = (n, fmt) => {
+      n.childNodes.forEach(ch => {
+        if (ch.nodeType === 3) { const tx = ch.textContent.replace(/\s+/g, ' '); if (!tx.trim() && !out[out.length - 1].length) return; out[out.length - 1].push({ ...fmt, text: tx }); return; }
+        if (ch.nodeType !== 1) return;
+        const t = ch.tagName, st = ch.getAttribute('style') || '';
+        if (t === 'BR') { out.push([]); return; }
+        const f = { ...fmt };
+        if (t === 'B' || t === 'STRONG' || /font-weight:\s*(bold|[6-9]00)/i.test(st)) f.b = true;
+        if (t === 'I' || t === 'EM' || /font-style:\s*italic/i.test(st)) f.i = true;
+        if (t === 'U' || /text-decoration:[^;]*underline/i.test(st)) f.u = true;
+        const col = (st.match(/(?:^|;)\s*color:\s*#?([0-9a-f]{6})/i) || [])[1] || (ch.getAttribute('color') || '').replace('#', ''); if (/^[0-9a-f]{6}$/i.test(col) && col !== '000000') f.color = col.toUpperCase();
+        const bg = (st.match(/background(?:-color)?:\s*#?([0-9a-f]{6})/i) || [])[1]; if (bg && bg.toUpperCase() !== 'FFFFFF') f.bg = bg.toUpperCase();
+        const block = /^(P|DIV|LI|H\d)$/.test(t);
+        if (block && out[out.length - 1].length) out.push([]);
+        walk(ch, f);
+        if (block) out.push([]);
+      });
+    };
+    walk(el, {});
+    const keep = out.filter((segs, i) => segs.some(x => x.text.trim()) || (i > 0 && out[i - 1].some(x => x.text.trim())));
+    return keep.map(segs => ({ text: segs.map(s => s.text).join('').replace(/ /g, ' ').trim(), html: segs.map(s => { let h = esc(s.text); if (s.color) h = `<font color="#${s.color}">${h}</font>`; if (s.bg) h = `<span style="background-color:#${s.bg}">${h}</span>`; if (s.u) h = `<u>${h}</u>`; if (s.i) h = `<i>${h}</i>`; if (s.b) h = `<b>${h}</b>`; return h; }).join('').trim() }));
+  };
+  const tables = [...dom.querySelectorAll('table')].filter(t => !t.parentElement.closest('table'));
+  if (!tables.length) throw new Error('No table found. The file should have the handover table.');
+  let head = null;
+  for (const el of dom.body.querySelectorAll('p,div,h1,h2,h3,span')) { if (el.closest('table')) continue; head = parseHeaderLine(el.textContent); if (head) break; }
+  const out = [];
+  tables.forEach(t => [...t.rows].forEach(tr => { const r = parseHandoverRow([...tr.cells].map(lines)); if (r && r.name && !/^NAME\b|^PATIENT/i.test(r.name)) out.push(r); }));
+  if (!out.length) throw new Error('No patients found in the table.');
+  return { date: head ? head.date : '', shift: head ? head.shift : '', doctors: head ? head.doctors : '', rows: out };
+}
+async function parseHandoverFile(buf) {
+  const u8 = new Uint8Array(buf);
+  if (u8[0] === 0x50 && u8[1] === 0x4B) return parseHandoverDocx(buf);                       // .docx (zip)
+  if (u8[0] === 0xD0 && u8[1] === 0xCF && u8[2] === 0x11 && u8[3] === 0xE0) return parseHandoverDoc(buf); // old .doc
+  const head = new TextDecoder('utf-8').decode(u8.subarray(0, 2000)).toLowerCase();
+  if (/<html|<table|xmlns:w=|<!doctype/.test(head)) {
+    let str = new TextDecoder('utf-8').decode(u8);
+    const cs = (str.match(/charset=["']?([\w-]+)/i) || [])[1];
+    if (cs && !/utf-?8/i.test(cs)) { try { str = new TextDecoder(cs).decode(u8); } catch {} }
+    return parseHandoverHtml(str);
+  }
+  if (head.startsWith('{\\rtf')) throw new Error('This file is in RTF format. Open it in Word and save it as Word Document (.docx).');
+  throw new Error('This is not a Word file. Choose a .docx or .doc file.');
 }
 async function parseHandoverDocx(buf) {
   const ff = await loadFflate();
-  let files; try { files = ff.unzipSync(new Uint8Array(buf)); } catch { throw new Error('This file is not a Word .docx file. If it is an old .doc file, open it in Word and save it as .docx.'); }
+  let files; try { files = ff.unzipSync(new Uint8Array(buf)); } catch { throw new Error('This Word file could not be opened. It may be damaged.'); }
   const xml = n => files[n] ? new DOMParser().parseFromString(ff.strFromU8(files[n]), 'application/xml') : null;
-  const doc = xml('word/document.xml'); if (!doc) throw new Error('This file is not a Word .docx file.');
+  const doc = xml('word/document.xml'); if (!doc) throw new Error('This Word file could not be read.');
   const body = doc.getElementsByTagNameNS(W_NS, 'body')[0];
   // header line: Word page header first, then text above the table
   let head = null;
@@ -1747,11 +2026,11 @@ const IMP = { data: null, file: '' };
 function pickImportFile() {
   closeModal();
   const inp = document.createElement('input'); inp.type = 'file';
-  inp.accept = '.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  inp.accept = '.docx,.doc,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword';
   inp.onchange = async () => {
     const f = inp.files && inp.files[0]; if (!f) return;
     toast('Reading ' + f.name + '…', 1500);
-    try { const parsed = await parseHandoverDocx(await f.arrayBuffer()); IMP.data = parsed; IMP.file = f.name; if (!parsed.date) parsed.date = (f.name.match(/\d{4}-\d{2}-\d{2}/) || [todayISO()])[0]; const t = f.name.match(/_(\d{2})(\d{2})\.docx$/i); await openImportPreview(parsed.date, null, t ? `${t[1]}:${t[2]}` : '08:00'); }
+    try { const parsed = await parseHandoverFile(await f.arrayBuffer()); IMP.data = parsed; IMP.file = f.name; if (!parsed.date) parsed.date = (f.name.match(/\d{4}-\d{2}-\d{2}/) || [todayISO()])[0]; const t = f.name.match(/_(\d{2})(\d{2})\.docx?$/i); await openImportPreview(parsed.date, null, t ? `${t[1]}:${t[2]}` : '08:00'); }
     catch (e) { console.error(e); toast(e.message || String(e), 5000); }
   };
   inp.click();
@@ -1782,7 +2061,7 @@ async function openImportPreview(date, target, hm) {
   IMP.dayExists = !!day; IMP.sheet = day ? day.sheet : null;
   const cnt = s => IMP.plan.filter(p => p.status === s).length;
   const badge = { new: '<span class="badge new">New</span>', updated: '<span class="badge">Updated</span>', same: '<span class="badge" style="opacity:.6">No change</span>', carried: '<span class="badge">From ' + (prev ? esc(fmtSidShort(prev.sid)) : 'before') + '</span>' };
-  openModal(`<div class="modal-head"><button class="icon-btn" data-action="close" aria-label="Close">${icon('x')}</button><h3>Import DOCX</h3><button class="btn primary" data-action="import-go">Import</button></div>
+  openModal(`<div class="modal-head"><button class="icon-btn" data-action="close" aria-label="Close">${icon('x')}</button><h3>Import Word file</h3><button class="btn primary" data-action="import-go">Import</button></div>
     <div class="modal-body">
       <div class="panel"><h4>${esc(IMP.file)}</h4>
         <div class="row">
@@ -2775,5 +3054,5 @@ function registerSW() {
 }
 
 // exposed for testing
-window.__handover = { S, buildDocx, sanitizeHtml, htmlToParagraphs, parseHandoverDocx, exportListOf, rowOf, summarise };
+window.__handover = { S, buildDocx, sanitizeHtml, htmlToParagraphs, parseHandoverDocx, parseHandoverFile, readDocBinary, exportListOf, rowOf, summarise };
 boot();
