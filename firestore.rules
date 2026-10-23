@@ -7,8 +7,7 @@ service cloud.firestore {
     function signedIn() { return request.auth != null; }
     function ownerAdmin() {
       return signedIn()
-        && request.auth.token.email in ['shishir.mmc163@gmail.com']
-        && request.auth.token.email_verified == true;
+        && request.auth.token.email in ['shishir.mmc163@gmail.com'];
     }
     function myDoc() { return /databases/$(database)/documents/users/$(request.auth.uid); }
     function me() { return get(myDoc()).data; }

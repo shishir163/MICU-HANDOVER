@@ -3,7 +3,7 @@
 
 const CFG = window.HANDOVER_CONFIG || {};
 const DEMO = !(CFG.firebase && CFG.firebase.apiKey) || !!CFG.forceDemo;
-const APP_VERSION = '3.3.0';
+const APP_VERSION = '3.3.1';
 
 /* ---------------- small helpers ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -213,7 +213,6 @@ class FirebaseStore {
     this.pendingName = name;
     const c = await this.fb.createUserWithEmailAndPassword(this.auth, e, p);
     try { await this.fb.updateProfile(c.user, { displayName: name }); } catch { }
-    if (isAdminEmail(e)) { try { await this.fb.sendEmailVerification(c.user); } catch { } }
     return c;
   }
   resetPassword(e) { return this.fb.sendPasswordResetEmail(this.auth, e); }
@@ -227,7 +226,6 @@ class FirebaseStore {
     if (snap.exists()) return snap.data();
     const name = user.name || this.pendingName || user.email.split('@')[0];
     if (isAdminEmail(user.email)) {
-      if (!user.emailVerified) return { uid: user.uid, email: user.email, name, role: 'admin', status: 'unverified' };
       const p = { uid: user.uid, email: user.email, name, role: 'admin', status: 'approved', createdAt: Date.now() };
       await setDoc(this.uref(user.uid), p); return p;
     }
