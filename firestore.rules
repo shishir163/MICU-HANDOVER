@@ -1,0 +1,66 @@
+rules_version = '2';
+// Firebase Console → Firestore Database → Rules → paste all of this → Publish.
+// The admin email below must match adminEmails in config.js.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function ownerAdmin() {
+      return signedIn()
+        && request.auth.token.email in ['shishir.mmc163@gmail.com']
+        && request.auth.token.email_verified == true;
+    }
+    function myDoc() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function me() { return get(myDoc()).data; }
+    function approved() { return signedIn() && exists(myDoc()) && me().status == 'approved'; }
+    function isAdmin() { return ownerAdmin() || (approved() && me().role == 'admin'); }
+    function member() { return approved() || ownerAdmin(); }
+
+    // Accounts
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // a new person can only create their own account as "pending"
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && ((request.resource.data.status == 'pending' && request.resource.data.role == 'mo') || ownerAdmin());
+      // admin approves / blocks; a person may only change their own name or device list
+      allow update: if isAdmin()
+        || (request.auth.uid == uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'devices', 'lastSeen']));
+      allow delete: if isAdmin();
+    }
+
+    // Beds, categories (admin edits, team reads)
+    match /settings/{doc} {
+      allow read: if member();
+      allow write: if isAdmin();
+    }
+
+    // Daily sheets and their patients
+    match /sheets/{date} {
+      allow read, create, update: if member();
+      allow delete: if isAdmin();
+      match /entries/{id} {
+        allow read, write: if member();
+      }
+      // change history: anyone in the team can add, nobody can rewrite it
+      match /log/{id} {
+        allow read, create: if member();
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    // One summary per patient admission (for search and data later)
+    match /patients/{id} {
+      allow read, write: if member();
+    }
+
+    // Study area: admin, plus people the admin gives "view" or "edit" (Settings → Users)
+    function studyReader() { return isAdmin() || (approved() && me().study in ['view', 'edit']); }
+    function studyWriter() { return isAdmin() || (approved() && me().study == 'edit'); }
+    match /rpatients/{id} { allow read: if studyReader(); allow write: if studyWriter(); }
+    match /cpr/{id} { allow read: if studyReader(); allow write: if studyWriter(); }
+    match /studies/{id} { allow read: if studyReader(); allow write: if studyWriter(); }
+    match /studyrec/{id} { allow read: if studyReader(); allow write: if studyWriter(); }
+    match /rsettings/{id} { allow read: if studyReader(); allow write: if studyWriter(); }
+  }
+}
