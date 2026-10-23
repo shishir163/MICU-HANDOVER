@@ -3,7 +3,7 @@
 
 const CFG = window.HANDOVER_CONFIG || {};
 const DEMO = !(CFG.firebase && CFG.firebase.apiKey) || !!CFG.forceDemo;
-const APP_VERSION = '3.4.0';
+const APP_VERSION = '3.5.0';
 
 /* ---------------- small helpers ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -195,7 +195,7 @@ class DemoStore {
 
 function patientSummary(sid, e) {
   const date = sidDate(sid);
-  return { id: e.id, name: e.name || '', age: e.age || '', uhid: e.uhid || '', bed: e.bed || '', category: e.category || 'other', doa: e.doa || '', micuDate: e.micuDate || '', consultant: e.consultant || '', diagnosisText: htmlToText(e.diagnosis).slice(0, 600), outcome: e.outcome || 'active', outcomeDate: e.outcome && e.outcome !== 'active' ? date : '', lastSheet: sid, updatedAt: Date.now() };
+  return { id: e.id, name: e.name || '', age: e.age || '', uhid: e.uhid || '', bed: e.bed || '', category: e.category || 'other', doa: e.doa || '', micuDate: e.micuDate || '', consultant: e.consultant || '', source: e.source || '', cpr: clone(e.cpr || []), diagnosisText: htmlToText(e.diagnosis).slice(0, 600), outcome: e.outcome || 'active', outcomeDate: e.outcome && e.outcome !== 'active' ? date : '', lastSheet: sid, updatedAt: Date.now() };
 }
 
 class FirebaseStore {
@@ -671,7 +671,7 @@ function cardHTML(e) {
       <div class="bedbox">${esc(e.bed || '—')}</div>
       <div class="who"><div class="name">${esc(e.name || 'Unnamed')}</div>
         <div class="meta">${age ? `<span>${esc(age)}</span>` : ''}${day && day > 0 ? `<span><b>ICU D${day}</b></span>` : ''}${e.consultant ? `<span>${esc(e.consultant)}</span>` : ''}</div></div>
-      <div class="badges">${left ? `<span class="badge left">${esc(out ? out.label : e.outcome)}</span>` : (!e.carried ? '<span class="badge new">New</span>' : '')}${e.uhid ? `<span class="badge">${esc(e.uhid)}</span>` : ''}</div>
+      <div class="badges">${left ? `<span class="badge left">${esc(out ? out.label : e.outcome)}</span>` : (!e.carried ? '<span class="badge new">New</span>' : '')}${e.cpr && e.cpr.length ? `<span class="badge left">CPR${e.cpr.length > 1 ? ' ×' + e.cpr.length : ''}</span>` : ''}${e.uhid ? `<span class="badge">${esc(e.uhid)}</span>` : ''}</div>
     </div>
     ${e.diagnosis ? `<div class="sec"><div class="lbl">Diagnosis</div><div class="clamp" style="--lines:3">${esc(htmlToText(e.diagnosis))}</div></div>` : ''}
     ${e.plan ? `<div class="sec extra"><div class="lbl">Status &amp; plan</div><div class="clamp" style="--lines:5">${esc(htmlToText(e.plan))}</div></div>` : ''}
@@ -730,6 +730,57 @@ function openAddChooser() {
 
 /* ---------------- came-and-left form (works inside other windows) ---------------- */
 function nowLocal() { const d = new Date(); return `${todayISO()}T${pad(d.getHours())}:${pad(d.getMinutes())}`; }
+/* ---------- CPR given during this ICU stay (written on the handover card) ---------- */
+const CPR_PLACES = ['ICU', 'Emergency', 'Ward', 'OT', 'Other hospital', 'Before arrival'];
+function cprLine(c) { return `${fmtDM(c.date)}${c.time ? ' ' + c.time : ''} · ${c.place || 'ICU'}${c.minutes ? ' · ' + c.minutes + ' min' : ''} · ROSC ${c.rosc === 'yes' ? 'yes' : 'no'}`; }
+function cprListHtml(list) {
+  return (list || []).map(c => `<button type="button" class="result" data-cpr-id="${esc(c.id)}" style="--c:var(--danger)"><div class="u"><b>CPR</b> <span class="help">${esc(cprLine(c))}</span>${c.note ? `<div class="help">${esc(c.note)}</div>` : ''}</div><span class="badge left">Edit</span></button>`).join('')
+    || '<p class="help" style="margin:0 0 8px">No CPR in this ICU stay.</p>';
+}
+// list = working array; onChange re-renders
+function cprEventDialog(ev, defDate, onSave, onDelete) {
+  let r = document.getElementById('cpr-root');
+  if (!r) { r = document.createElement('div'); r.id = 'cpr-root'; document.body.appendChild(r); }
+  const n = nowParts();
+  const c = ev || { id: newId().slice(0, 14), date: defDate || n.date, time: n.time, place: 'ICU', minutes: '', rosc: 'yes', note: '' };
+  r.innerHTML = `<div class="modal-backdrop dialog"><div class="modal small" role="dialog" aria-modal="true">
+    <div class="modal-head"><button class="icon-btn" data-cx="close" aria-label="Close">${icon('x')}</button><h3>${ev ? 'Edit CPR' : 'CPR given'}</h3><button class="btn primary" data-cx="save">OK</button></div>
+    <div class="modal-body"><div class="row">
+      <label class="field"><span>Date</span><input class="input" type="date" id="cx_date" value="${esc(c.date)}"></label>
+      <label class="field"><span>Time</span><input class="input" type="time" id="cx_time" value="${esc(c.time || '')}"></label>
+      <label class="field"><span>Where the arrest happened</span><select class="input" id="cx_place">${opt([...new Set([...CPR_PLACES, c.place].filter(Boolean))], c.place)}</select></label>
+      <label class="field"><span>CPR duration (minutes)</span><input class="input" id="cx_min" inputmode="numeric" value="${esc(c.minutes || '')}"></label>
+      <div class="field" style="grid-column:1/-1"><span>ROSC</span><div class="opt-row" id="cx_rosc">${[['yes', 'Yes, ROSC'], ['no', 'No ROSC']].map(([v, l]) => `<button type="button" class="opt ${c.rosc === v ? 'on' : ''}" data-v="${v}">${l}</button>`).join('')}</div></div>
+    </div>
+    <label class="field" style="margin-top:10px"><span>Note</span><input class="input" id="cx_note" value="${esc(c.note || '')}" placeholder="e.g. VF, 2 shocks"></label>
+    <p class="help">Only a CPR in this ICU stay. An old CPR (H/O CPR years ago) stays in the diagnosis — don't add it here.</p>
+    ${ev ? `<button class="btn danger block" data-cx="del" style="margin-top:12px">${icon('trash')} Remove this CPR</button>` : ''}
+    </div></div></div>`;
+  const close = () => { r.innerHTML = ''; };
+  let rosc = c.rosc;
+  r.querySelectorAll('#cx_rosc .opt').forEach(b => b.onclick = () => { rosc = b.dataset.v; r.querySelectorAll('#cx_rosc .opt').forEach(x => x.classList.toggle('on', x === b)); });
+  r.querySelector('[data-cx="close"]').onclick = close;
+  r.querySelector('[data-cx="save"]').onclick = () => {
+    const v = id => r.querySelector('#' + id).value.trim();
+    if (!validISO(v('cx_date'))) { toast('Choose the date'); return; }
+    onSave({ ...c, date: v('cx_date'), time: v('cx_time'), place: v('cx_place'), minutes: v('cx_min').replace(/[^\d.]/g, ''), rosc, note: v('cx_note'), by: S.profile.name || S.user.email, at: Date.now() });
+    close();
+  };
+  const d = r.querySelector('[data-cx="del"]'); if (d) d.onclick = () => { close(); onDelete && onDelete(c); };
+}
+function wireCprBox(box, list, defDate) {
+  const draw = () => {
+    box.querySelector('.cpr-list').innerHTML = cprListHtml(list);
+    box.querySelectorAll('[data-cpr-id]').forEach(b => b.onclick = () => {
+      const ev = list.find(x => x.id === b.dataset.cprId);
+      cprEventDialog(ev, defDate, nv => { Object.assign(ev, nv); draw(); }, () => { list.splice(list.indexOf(ev), 1); draw(); });
+    });
+  };
+  box.querySelector('.cpr-add').onclick = () => cprEventDialog(null, typeof defDate === 'function' ? defDate() : defDate, nv => { list.push(nv); draw(); });
+  draw();
+}
+const cprBoxHtml = () => `<div class="cpr-box"><div class="cpr-list"></div><button type="button" class="btn cpr-add">${icon('plus')} CPR given</button></div>`;
+
 function interimForm(e, { onSave, onDelete } = {}) {
   e = e || {};
   const r = $('#dialog-root');
@@ -749,9 +800,12 @@ function interimForm(e, { onSave, onDelete } = {}) {
       </div><datalist id="dlSrc2">${S.settings.sources.map(s => `<option value="${esc(s)}">`).join('')}</datalist>
       <div class="field" style="margin-top:10px"><span>Diagnosis</span><textarea class="input" id="if_dx" rows="2">${esc(htmlToText(e.diagnosis || ''))}</textarea>${tagRow('Tap to add', '#if_dx', S.settings.dxTags, 'dx')}</div>
       <label class="field"><span>Note (what happened)</span><textarea class="input" id="if_note" rows="3">${esc(e.outcomeNote || '')}</textarea></label>
+      <div class="field" style="margin-top:10px" id="if_cpr"><span>CPR in ICU</span>${cprBoxHtml()}</div>
       ${onDelete ? `<button class="btn danger block" data-ifx="delete">${icon('trash')} Delete</button>` : ''}
     </div></div></div></div>`;
   const close = () => { r.innerHTML = ''; };
+  const cprList = clone(e.cpr || []);
+  wireCprBox($('#if_cpr'), cprList, () => ($('#if_in').value || nowLocal()).slice(0, 10));
   r.querySelector('[data-ifx="close"]').onclick = close;
   r.querySelector('[data-ifx="save"]').onclick = () => {
     const v = id => $('#' + id).value.trim();
@@ -764,7 +818,7 @@ function interimForm(e, { onSave, onDelete } = {}) {
       ...e, id: e.id || newId(), interim: true, bed: v('if_bed'), name, age: v('if_age'), uhid: v('if_uhid'), category: e.category || 'other',
       inAt, outAt, outcome: v('if_out_k'), outcomeNote: v('if_note'), source: v('if_src').toUpperCase(), consultant: v('if_cons').toUpperCase(),
       doa: e.doa || inDate, micuDate: inDate, diagnosis: esc(v('if_dx')).replace(/\n/g, '<br>'), investigations: e.investigations || '', history: e.history || '', plan: e.plan || '', drugs: e.drugs || '', referral: e.referral || '',
-      carried: false, updatedBy: by, updatedAt: Date.now()
+      carried: false, updatedBy: by, updatedAt: Date.now(), cpr: cprList
     };
     close(); onSave && onSave(out);
   };
@@ -953,6 +1007,7 @@ function openEditor(id, bed) {
       <div class="panel"><h4>History</h4>${rteField('history', 'H/O FEVER AND COUGH FOR 7 DAYS…', true)}</div>
       <div class="panel"><h4>Current status, consultants' advice &amp; plan</h4>${rteField('plan', 'GCS 15, ON 2L O2… ENSURE CARDIO REF. DR. X: …', true)}</div>
       <div class="panel"><h4>Antibiotics / drugs</h4>${rteField('drugs', 'Tap the tags below or type (one per line)')}${tagRow('Antibiotics', '.rte[data-field="drugs"]', S.settings.abxTags, 'line')}${tagRow('Other drugs', '.rte[data-field="drugs"]', S.settings.drugTags, 'line')}</div>
+      <div class="panel" id="edCpr"><h4>CPR in ICU</h4>${cprBoxHtml()}</div>
       <div class="panel"><h4>Left ICU after this handover?</h4>
         <div class="outcomes" id="outcomes">${OUTCOMES.map(o => `<button type="button" data-action="outcome" data-v="${o.id}" class="${o.id === e.outcome ? 'on' : ''}">${esc(o.label)}</button>`).join('')}</div>
         <label class="field" style="margin-top:10px" id="outNoteWrap"><span>Note (time, where to)</span><input class="input" name="outcomeNote" value="${esc(e.outcomeNote || '')}" placeholder="e.g. 2 PM, to medicine ward"></label>
@@ -966,6 +1021,8 @@ function openEditor(id, bed) {
   body.dataset.id = e.id; body.dataset.outcome = e.outcome; body.dataset.isnew = existing ? '' : '1';
   body._orig = e;
   RICH_FIELDS.forEach(f => { $(`.rte[data-field="${f}"]`, body).innerHTML = e[f] || ''; });
+  body._cpr = clone(e.cpr || []);
+  wireCprBox($('#edCpr'), body._cpr, () => S.date || todayISO());
   $('#outNoteWrap').classList.toggle('hidden', e.outcome === 'active');
   setupRTE(body);
   if (existing) fillEditorHistory(e.id);
@@ -1115,6 +1172,7 @@ async function saveEntry() {
   RICH_FIELDS.forEach(f => { e[f] = sanitizeHtml($(`.rte[data-field="${f}"]`, body).innerHTML); });
   e.outcome = body.dataset.outcome || 'active';
   if (e.outcome === 'active') e.outcomeNote = '';
+  e.cpr = clone(body._cpr || []);
   if (!e.name) { toast('Please write the patient name'); $('[name=name]', body).focus(); return; }
   if (!e.bed) { toast('Please choose a bed'); $('[name=bed]', body).focus(); return; }
   if (e.outcome === 'active') {
@@ -1526,8 +1584,9 @@ function ask(msg, { ok = 'OK', cancel = 'Cancel', danger = false, title = '' } =
 /* =================================================================
    CHANGE HISTORY
    ================================================================= */
-const FIELD_LABELS = { bed: 'Bed', name: 'Name', age: 'Age', uhid: 'UHID', doa: 'DOA', micuDate: 'MICU date', consultant: 'Consultant', source: 'From', referral: 'Referral', diagnosis: 'Diagnosis', investigations: 'Investigations', history: 'History', plan: 'Status & plan', drugs: 'Drugs', outcome: 'Status', outcomeNote: 'Status note' };
-function changedFields(a, b) { return Object.keys(FIELD_LABELS).filter(k => String((a || {})[k] ?? '') !== String((b || {})[k] ?? '')); }
+const FIELD_LABELS = { bed: 'Bed', name: 'Name', age: 'Age', uhid: 'UHID', doa: 'DOA', micuDate: 'MICU date', consultant: 'Consultant', source: 'From', referral: 'Referral', cpr: 'CPR', diagnosis: 'Diagnosis', investigations: 'Investigations', history: 'History', plan: 'Status & plan', drugs: 'Drugs', outcome: 'Status', outcomeNote: 'Status note' };
+function fieldVal(v) { if (Array.isArray(v)) return v.length ? JSON.stringify(v.map(x => { const c = { ...x }; delete c.at; return c; })) : ''; return String(v ?? ''); }
+function changedFields(a, b) { return Object.keys(FIELD_LABELS).filter(k => fieldVal((a || {})[k]) !== fieldVal((b || {})[k])); }
 function logRec(action, e, fields, note) {
   return { at: Date.now(), by: S.profile.name || S.user.email, uid: S.user.uid, action, entryId: e ? e.id : '', name: e ? e.name || '' : '', bed: e ? e.bed || '' : '', fields: fields || [], note: note || '' };
 }
@@ -2096,6 +2155,10 @@ async function runImport() {
   try {
     await settle(S.store.importSheet(sid, meta, write, removeIds, logs));
     IMP.data = null; closeModal(); toast(`Imported ${IMP.plan.length} patients`); goTo(sid);
+    // keep a copy in Google Drive straight away (old dates are outside the 7-day auto-save)
+    if (S.settings.driveUrl && S.settings.driveAuto !== false && S.online && !DEMO) {
+      archiveSheet(sid).then(() => toast('Saved to Google Drive', 2500)).catch(e => { console.warn('archive', e); toast('Not saved to Google Drive yet. Menu → Save to Google Drive now.', 5000); });
+    }
   } catch (e) { if (btn) btn.disabled = false; saveFail(e); }
 }
 
@@ -2728,17 +2791,29 @@ async function abxFromHandovers() {
 }
 
 /* ---------- CPR register ---------- */
+// CPR written by the MOs on the handover cards + any added here by hand
+const PT_TO_CPR = { active: 'still', death: 'died', dama: 'dama', transfer: 'transfer', discharged: 'alive', ward: 'alive' };
+function cprFromSource(src) { const t = String(src || '').toUpperCase(); return !t ? '' : /ER\b|EMERG/.test(t) ? 'Emergency' : /WARD|CABIN/.test(t) ? 'Ward' : /\bOT\b|THEATRE/.test(t) ? 'OT' : /HDU|CCU/.test(t) ? 'HDU / CCU' : /HOSP|REFER/.test(t) ? 'Other hospital' : 'Other'; }
+function cprAll() {
+  const out = (ST.cpr || []).map(x => ({ ...x, ho: false }));
+  const seen = new Set();
+  (ST.patients || []).forEach(p => (p.cpr || []).forEach(c => {
+    if (seen.has(c.id)) return; seen.add(c.id);
+    out.push({ id: 'h-' + c.id, ho: true, pid: p.id, name: p.name, age: p.age, uhid: p.uhid, date: c.date, time: c.time || '', place: c.place || 'ICU', from: cprFromSource(p.source), minutes: c.minutes || '', rosc: c.rosc, outcome: PT_TO_CPR[p.outcome] || 'still', note: c.note || '', updatedBy: c.by || '' });
+  }));
+  return out;
+}
 async function renderCpr() {
   stBody(stTabs() + '<div class="loading"><div class="spinner"></div></div>');
   try { await loadPatients(); if (!ST.cpr) ST.cpr = await S.store.rList('cpr'); } catch (e) { stBody(stTabs() + `<p class="err">${esc(e.code || e.message)}</p>`); return; }
-  const all = ST.cpr.slice().sort((a, b) => `${b.date}${b.time}`.localeCompare(`${a.date}${a.time}`));
+  const all = cprAll().sort((a, b) => `${b.date}${b.time}`.localeCompare(`${a.date}${a.time}`));
   const ranges = [['30', 'Last 30 days'], ['90', '3 months'], ['365', '1 year'], ['all', 'All']];
   const from = ST.cprRange === 'all' ? '' : addDays(todayISO(), -(+ST.cprRange - 1));
   const list = all.filter(x => !from || x.date >= from);
   const n = list.length, pc = k => n ? Math.round(100 * k / n) : 0;
   const rosc = list.filter(x => x.rosc === 'yes').length, cnt = id => list.filter(x => x.outcome === id).length;
   const places = [...new Set(list.map(x => x.place || 'Not written'))];
-  const hint = x => { const p = x.pid && patientById(x.pid); if (!p || p.outcome === 'active') return ''; const map = { death: 'died', dama: 'dama', transfer: 'transfer', discharged: 'alive', ward: 'alive' }; const want = map[p.outcome]; return want && want !== x.outcome ? `<div class="help" style="color:var(--danger)">Handover says: ${esc(outLabel(p.outcome))}. Tap to update.</div>` : ''; };
+  const hint = x => { if (x.ho) return ''; const p = x.pid && patientById(x.pid); if (!p || p.outcome === 'active') return ''; const map = { death: 'died', dama: 'dama', transfer: 'transfer', discharged: 'alive', ward: 'alive' }; const want = map[p.outcome]; return want && want !== x.outcome ? `<div class="help" style="color:var(--danger)">Handover says: ${esc(outLabel(p.outcome))}. Tap to update.</div>` : ''; };
   stBody(stTabs() + `
     <div class="opt-row" style="margin-bottom:10px">${ranges.map(([v, l]) => `<button class="opt ${ST.cprRange === v ? 'on' : ''}" data-action="cpr-range" data-v="${v}">${l}</button>`).join('')}</div>
     <div class="tiles">
@@ -2753,11 +2828,12 @@ async function renderCpr() {
     <div class="opt-row" style="margin-bottom:10px">${canStudyEdit() ? `<button class="btn primary" data-action="cpr-edit">${icon('plus')} Add a CPR</button>` : ''}<button class="btn" data-action="st-csv" data-v="cpr">${icon('file')} CPR CSV</button></div>
     ${list.map(x => { const o = CPR_OUT.find(k => k.id === x.outcome); return `<button class="result ${x.outcome === 'died' ? 'cc-red' : x.outcome === 'alive' ? 'cc-green' : ''}" data-action="cpr-edit" data-id="${esc(x.id)}" style="--c:var(--danger)">
       <div class="bedbox" style="font-size:.75em;line-height:1.15;text-align:center">${esc(fmtDM(x.date))}<br>${esc(x.time || '')}</div>
-      <div class="u"><b>${esc(x.name || '—')}</b> <span class="help">${esc(ageText(x.age))}</span>
+      <div class="u"><b>${esc(x.name || '—')}</b> <span class="help">${esc(ageText(x.age))}</span>${x.ho ? ' <span class="badge">From handover</span>' : ''}
         <div class="help">Arrest in ${esc(x.place || '?')}${x.from ? ' · came from ' + esc(x.from) : ''} · ${x.minutes ? esc(x.minutes) + ' min CPR · ' : ''}ROSC ${x.rosc === 'yes' ? 'yes' : 'no'}</div>${hint(x)}</div>
       <span class="badge ${x.outcome === 'alive' ? 'new' : x.outcome === 'still' ? '' : 'left'}">${esc(o ? o.label : '')}</span></button>`; }).join('') || '<p class="help">No CPR recorded in this period.</p>'}`);
 }
 function cprDialog(id) {
+  if (id && id.startsWith('h-')) { const h = cprAll().find(c => c.id === id); dlg('CPR from the handover', `<p><b>${esc(h ? h.name : '')}</b></p><p class="help">${h ? esc(cprLine(h)) : ''}${h && h.note ? '<br>' + esc(h.note) : ''}${h && h.updatedBy ? '<br>Written by ' + esc(h.updatedBy) : ''}</p><p class="help">This was written on the handover. To change it, open the patient's card on the handover and edit "CPR in ICU". The final result follows the patient's status on the handover.</p>`); return; }
   const x = id ? ST.cpr.find(c => c.id === id) : null;
   const n = nowParts();
   const cur = x || { pid: '', name: '', age: '', uhid: '', date: n.date, time: n.time, place: 'ICU', from: '', minutes: '', rosc: 'yes', outcome: 'still', note: '' };
@@ -2959,9 +3035,10 @@ async function studyCsv(kind) {
     const baseHead = ['Age', 'MICU date', 'Outcome', 'Outcome date'];
     let rows, name;
     if (kind === 'cpr') {
-      const list = ST.cpr || await S.store.rList('cpr');
-      rows = [[...whoHead, 'Age', 'Date', 'Time', 'Arrest place', 'Came from', 'CPR minutes', 'ROSC', 'Result', 'On handover', 'Note'],
-        ...list.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)).map(x => [...(ST.deid ? [x.pid ? pcode[x.pid] : 'CPR-' + x.id.slice(0, 5)] : [x.pid ? pcode[x.pid] : '', x.name, x.uhid]), x.age, x.date, x.time, x.place, x.from, x.minutes, x.rosc === 'yes' ? 'Yes' : 'No', (CPR_OUT.find(o => o.id === x.outcome) || {}).label || '', x.pid ? 'Yes' : 'No', x.note || ''])];
+      if (!ST.cpr) ST.cpr = await S.store.rList('cpr'); await loadPatients();
+      const list = cprAll();
+      rows = [[...whoHead, 'Age', 'Date', 'Time', 'Arrest place', 'Came from', 'CPR minutes', 'ROSC', 'Result', 'On handover', 'Note', 'Written in'],
+        ...list.sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)).map(x => [...(ST.deid ? [x.pid ? pcode[x.pid] : 'CPR-' + x.id.slice(0, 5)] : [x.pid ? pcode[x.pid] : '', x.name, x.uhid]), x.age, x.date, x.time, x.place, x.from, x.minutes, x.rosc === 'yes' ? 'Yes' : 'No', (CPR_OUT.find(o => o.id === x.outcome) || {}).label || '', x.pid ? 'Yes' : 'No', x.note || '', x.ho ? 'Handover' : 'Study'])];
       name = 'MICU_CPR_register';
     } else {
       const all = await S.store.rList('rpatients');
