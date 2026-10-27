@@ -3,7 +3,7 @@
 
 const CFG = window.HANDOVER_CONFIG || {};
 const DEMO = !(CFG.firebase && CFG.firebase.apiKey) || !!CFG.forceDemo;
-const APP_VERSION = '3.5.0';
+const APP_VERSION = '3.6.0';
 
 /* ---------------- small helpers ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -102,6 +102,7 @@ const S = {
   date: todayISO(), sid: null, sheetList: [], listReady: false, sheet: undefined, entries: [], prevInfo: null,
   prefs: loadPrefs(), search: '', subs: [], sheetUnsub: null, mainOn: false, online: navigator.onLine
 };
+const DRIVE_FIELDS = ['driveUrl', 'driveKey', 'driveAuto', 'driveFolderUrl', 'driveSheetUrl'];
 const isAdmin = () => S.profile && S.profile.role === 'admin' && S.profile.status === 'approved';
 const catOf = () => ({ id: 'other', name: '', color: 'var(--primary)' });
 const catOfOld = id => S.settings.categories.find(c => c.id === id) || S.settings.categories.find(c => c.id === 'other') || { id: 'other', name: 'Other', color: '#64748b' };
@@ -137,6 +138,9 @@ class DemoStore {
   async ensureProfile(u) { return clone(this.mem.users.find(x => x.uid === u.uid)); }
   watchProfile(uid, cb) { const f = () => { const u = this.mem.users.find(x => x.uid === uid); if (u) cb(clone(u)); }; this.listeners.add(f); return () => this.listeners.delete(f); }
   watchSettings(cb) { const f = () => cb(this.mem.settings || null); f(); this.listeners.add(f); return () => this.listeners.delete(f); }
+  watchDrive(cb) { const f = () => cb(this.mem.drive || null); f(); this.listeners.add(f); return () => this.listeners.delete(f); }
+  async saveDrive(d) { this.mem.drive = { ...(this.mem.drive || {}), ...clone(d) }; this.persist(); }
+  async clearLegacyDrive() { if (this.mem.settings) DRIVE_FIELDS.forEach(k => delete this.mem.settings[k]); this.persist(); }
   async saveSettings(s) { this.mem.settings = { ...(this.mem.settings || {}), ...clone(s) }; this.persist(); }
   watchSheet(sid, cb) {
     const f = () => cb(this.mem.sheets[sid] ? clone(this.mem.sheets[sid]) : null, Object.values(clone(this.mem.entries[sid] || {})));
@@ -191,6 +195,7 @@ class DemoStore {
   async listUsers() { return clone(this.mem.users); }
   async setUser(uid, patch) { const u = this.mem.users.find(x => x.uid === uid); if (u) Object.assign(u, clone(patch)); this.persist(); }
   async signOut() { toast('Demo mode: sign-out is turned off'); }
+  async wipe() { }
 }
 
 function patientSummary(sid, e) {
@@ -217,6 +222,12 @@ class FirebaseStore {
   }
   resetPassword(e) { return this.fb.sendPasswordResetEmail(this.auth, e); }
   signOut() { return this.fb.signOut(this.auth); }
+  async wipe() {
+    try { await settle(this.fb.waitForPendingWrites(this.db), 4000); } catch { }
+    try { await this.fb.signOut(this.auth); } catch { }
+    await this.fb.terminate(this.db);
+    await this.fb.clearIndexedDbPersistence(this.db);
+  }
   resendVerification() { return this.fb.sendEmailVerification(this.auth.currentUser); }
   async reloadUser() { const u = this.auth.currentUser; await u.reload(); await u.getIdToken(true); return this.mapUser(this.auth.currentUser); }
   uref(uid) { return this.fb.doc(this.db, 'users', uid); }
@@ -235,6 +246,10 @@ class FirebaseStore {
   watchProfile(uid, cb) { return this.fb.onSnapshot(this.uref(uid), s => cb(s.exists() ? s.data() : null), e => console.warn(e)); }
   watchSettings(cb) { return this.fb.onSnapshot(this.fb.doc(this.db, 'settings', 'main'), s => cb(s.exists() ? s.data() : null), e => console.warn(e)); }
   saveSettings(s) { return this.fb.setDoc(this.fb.doc(this.db, 'settings', 'main'), clone(s), { merge: true }); }
+  // Drive link + secret key: admin-only document
+  watchDrive(cb) { return this.fb.onSnapshot(this.fb.doc(this.db, 'settings', 'drive'), s => cb(s.exists() ? s.data() : null), e => console.warn('drive settings', e)); }
+  saveDrive(d) { return this.fb.setDoc(this.fb.doc(this.db, 'settings', 'drive'), clone(d), { merge: true }); }
+  clearLegacyDrive() { const del = this.fb.deleteField(); return this.fb.updateDoc(this.fb.doc(this.db, 'settings', 'main'), Object.fromEntries(DRIVE_FIELDS.map(k => [k, del]))); }
   sref(date) { return this.fb.doc(this.db, 'sheets', date); }
   eref(date, id) { return this.fb.doc(this.db, 'sheets', date, 'entries', id); }
   pref(id) { return this.fb.doc(this.db, 'patients', id); }
@@ -407,18 +422,26 @@ async function boot() {
   applyPrefs();
   render(`<div class="loading"><div class="spinner"></div></div>`);
   S.store = DEMO ? new DemoStore() : new FirebaseStore();
+  await wipeLeftovers();
   try { await S.store.init(); }
   catch (e) { console.error(e); return renderFatal('Could not start the app. Check your internet and the Firebase settings in config.js.', e); }
   S.store.onAuth(async user => {
     stopMain(); S.subs.forEach(u => u()); S.subs = [];
     S.user = user;
-    if (!user) { S.profile = null; return renderAuth('signin'); }
+    if (!user) {
+      S.profile = null; LOCK.unlocked = false; renderAuth('signin');
+      let why = null; try { why = sessionStorage.getItem(WIPED_KEY); sessionStorage.removeItem(WIPED_KEY); } catch { }
+      if (why && WIPE_MSG[why]) setTimeout(() => toast(WIPE_MSG[why], 7000), 300);
+      return;
+    }
     render(`<div class="loading"><div class="spinner"></div></div>`);
     try {
       S.profile = await S.store.ensureProfile(user);
+      const w0 = shouldWipe(S.profile); if (w0) return wipeDevice(w0);
       try { await registerDevice(); } catch (e) { console.warn('device', e); }
       route();
       S.subs.push(S.store.watchProfile(user.uid, p => {
+        const w = shouldWipe(p); if (w) return wipeDevice(w);
         if (!p) return;
         const key = x => [x.status, x.role, deviceAllowedFor(x)].join('|');
         const changed = !S.profile || key(p) !== key(S.profile);
@@ -438,7 +461,7 @@ function route() {
       if ((S.profile.devices || []).length < maxDevices()) { registerDevice().then(route).catch(e => renderFatal('Could not register this device.', e)); return; }
       stopMain(); return renderDevices();
     }
-    return startMain();
+    startMain(); ensureLock(); return;
   }
   stopMain();
   if (st === 'unverified') return renderVerify();
@@ -515,7 +538,15 @@ function startMain() {
   if (!S.mainOn) {
     S.mainOn = true; S.listReady = false;
     S.mainSubs = [
-      S.store.watchSettings(s => { S.settings = { ...DEFAULT_SETTINGS(), ...(s || {}) }; if (S.settings.categories?.length === 0) S.settings.categories = clone(DEFAULT_CATEGORIES); renderSheetArea(); setTimeout(autoArchive, 4000); }),
+      S.store.watchSettings(s => {
+        const main = { ...(s || {}) }, legacy = {};
+        DRIVE_FIELDS.forEach(k => { if (k in main) { legacy[k] = main[k]; delete main[k]; } });
+        S.legacyDrive = Object.keys(legacy).length ? legacy : null;
+        S.settings = { ...DEFAULT_SETTINGS(), ...main, ...(S.drive || {}) };
+        if (S.settings.categories?.length === 0) S.settings.categories = clone(DEFAULT_CATEGORIES);
+        migrateDrive(); renderSheetArea(); setTimeout(autoArchive, 4000);
+      }),
+      ...(isAdmin() ? [S.store.watchDrive(d => { S.drive = d || {}; S.driveLoaded = true; Object.assign(S.settings, S.drive); migrateDrive(); })] : []),
       S.store.watchSheetList(list => {
         S.sheetList = list || [];
         if (!S.listReady) { S.listReady = true; openSheet(S.sid && S.sheetList.some(x => x.sid === S.sid) ? S.sid : (S.sheetList[0] ? S.sheetList[0].sid : null)); }
@@ -831,7 +862,7 @@ function openInterim(id) {
       const fields = e ? changedFields(e, out) : [];
       try { const r = await settle(S.store.saveEntry(S.sid, out, logRec(e ? 'edit' : 'add', out, fields, 'came and left'))); closeModal(); toast(savedMsg(r)); } catch (err) { saveFail(err); }
     },
-    onDelete: e ? async () => {
+    onDelete: e && isAdmin() ? async () => {
       if (!(await ask(`Delete ${e.name} from this handover?`, { ok: 'Delete', danger: true }))) return;
       try { await settle(S.store.deleteEntry(S.sid, e.id, logRec('delete', e))); toast('Deleted'); } catch (err) { saveFail(err); }
     } : null
@@ -1015,7 +1046,8 @@ function openEditor(id, bed) {
         ${existing && existing.updatedBy ? `<div class="updated">Last saved by ${esc(existing.updatedBy)} · ${esc(fmtTime(existing.updatedAt))}</div>` : ''}
       </div>
       ${existing ? '<div class="panel" id="edHistory"><p class="help">Loading history…</p></div>' : ''}
-      ${existing ? `<button class="btn danger block" data-action="delete-entry">${icon('trash')} Delete from this handover sheet</button>` : ''}
+      ${existing && isAdmin() ? `<button class="btn danger block" data-action="delete-entry">${icon('trash')} Delete from this handover sheet</button>` : ''}
+      ${existing && !isAdmin() ? `<p class="help">Added by mistake? Ask the admin to delete it.</p>` : ''}
     </div>`);
   const body = $('#edBody');
   body.dataset.id = e.id; body.dataset.outcome = e.outcome; body.dataset.isnew = existing ? '' : '1';
@@ -1426,10 +1458,12 @@ function openSettings(tab) {
   if (setTab === 'account') body = `
     <div class="panel"><h4>Signed in</h4><b>${esc(S.profile.name || '')}</b><div class="help">${esc(S.profile.email || '')} · ${esc(S.profile.role === 'admin' ? 'Admin' : 'Medical officer')}</div></div>
     <div class="panel"><h4>My devices (${(S.profile.devices || []).length}${limitApplies(S.profile) ? ' of ' + maxDevices() : ''})</h4>${deviceRows(S.profile.devices)}${limitApplies(S.profile) ? `<p class="help">Your account works on up to ${maxDevices()} devices. Remove one to use another phone or computer.</p>` : '<p class="help">Admin accounts have no device limit.</p>'}</div>
+    ${lockPanel()}
     <div class="panel"><h4>Data</h4><div class="help">${DEMO ? 'Demo mode — data is kept on this device only.' : 'Cloud mode — saved to Firebase and shared with your team. Works offline and syncs later.'}</div><div class="help">Version ${APP_VERSION}</div></div>
     ${DEMO ? `<button class="btn danger block" data-action="demo-reset">Reset demo data</button>` : `<button class="btn block" data-action="sign-out">${icon('out')} Sign out</button>`}`;
   openModal(`<div class="modal-head"><h3>Settings</h3><button class="icon-btn" data-action="close" aria-label="Close">${icon('x')}</button></div>
     <div class="modal-body"><div class="tabs">${tabs.map(([k, l]) => `<button class="${setTab === k ? 'on' : ''}" data-action="set-tab" data-v="${k}">${l}</button>`).join('')}</div>${body}</div>`);
+  if (setTab === 'account') wireLockPanel();
   const r = $('#fsRange'); if (r) r.addEventListener('input', () => { S.prefs.fontSize = +r.value; $('#fsv').textContent = r.value; savePrefs(); });
   if (setTab === 'users') loadUsers();
 }
@@ -1462,7 +1496,14 @@ const A = {
     if (!email) { $('#authErr').textContent = 'Write your email above first.'; return; }
     try { await S.store.resetPassword(email.trim()); toast('Password reset link sent to ' + email); } catch (e) { $('#authErr').textContent = authErr(e); }
   },
-  'sign-out': async () => { closeModal(); try { await S.store.signOut(); } catch (e) { toast(e.message); } },
+  'sign-out': async () => {
+    if (DEMO) { toast('Demo mode: sign-out is turned off'); return; }
+    if (!navigator.onLine && !(await ask('You are offline. Changes not yet sent to the server will be lost if you sign out now. Sign out anyway?', { ok: 'Sign out', danger: true }))) return;
+    closeModal(); wipeDevice('signout');
+  },
+  'pin-change': () => { closeModal(); pinPad('change', () => openSettings('account')); },
+  'lock-now': () => { closeModal(); lockNow(); },
+  'bio-toggle': async () => { const c = lockCfg(); if (!c) return; if (c.bio) { c.bio = ''; saveLockCfg(c); toast(bioLabel() + ' turned off'); } else await turnBioOn(); openSettings('account'); },
   'verify-resend': async () => { try { await S.store.resendVerification(); toast('Link sent'); } catch (e) { $('#vErr').textContent = authErr(e); } },
   'verify-check': async () => {
     try { const u = await S.store.reloadUser(); S.user = u; if (!u.emailVerified) { $('#vErr').textContent = 'Not verified yet. Open the link in the email first.'; return; } S.profile = await S.store.ensureProfile(u); route(); }
@@ -1530,14 +1571,14 @@ const A = {
   menu: () => openMenu(),
   import: () => pickImportFile(),
   'import-go': () => runImport(),
-  'imp-missing': t => { IMP.removeMissing = t.dataset.v === 'remove'; $$('[data-action="imp-missing"]').forEach(b => b.classList.toggle('on', b === t)); },
+  'imp-missing': t => { if (!isAdmin()) return; IMP.removeMissing = t.dataset.v === 'remove'; $$('[data-action="imp-missing"]').forEach(b => b.classList.toggle('on', b === t)); },
   'drive-now': async () => { closeModal(); toast('Saving to Google Drive…', 2000); try { await archiveSheet(S.sid); toast('Saved to Google Drive'); } catch (e) { console.error(e); toast(e.message || String(e), 5000); } },
   'drv-auto': t => { S.settings.driveAuto = t.dataset.v === '1'; $$('[data-action="drv-auto"]').forEach(b => b.classList.toggle('on', b === t)); },
-  'drv-save': async () => { try { await S.store.saveSettings({ driveUrl: $('#drvUrl').value.trim(), driveKey: $('#drvKey').value.trim(), driveAuto: S.settings.driveAuto !== false }); toast('Drive settings saved'); } catch (e) { saveFail(e); } },
+  'drv-save': async () => { try { await S.store.saveDrive({ driveUrl: $('#drvUrl').value.trim(), driveKey: $('#drvKey').value.trim(), driveAuto: S.settings.driveAuto !== false }); toast('Drive settings saved'); } catch (e) { saveFail(e); } },
   'drv-test': async () => {
     const out = $('#drvOut'); out.textContent = 'Testing…';
     S.settings.driveUrl = $('#drvUrl').value.trim(); S.settings.driveKey = $('#drvKey').value.trim();
-    try { const r = await postDrive({ action: 'ping' }); out.innerHTML = `Connected. Folder: <a href="${esc(r.folderUrl)}" target="_blank" rel="noopener">open</a> · Database sheet: <a href="${esc(r.sheetUrl)}" target="_blank" rel="noopener">open</a>`; await S.store.saveSettings({ driveUrl: S.settings.driveUrl, driveKey: S.settings.driveKey, driveAuto: S.settings.driveAuto !== false, driveFolderUrl: r.folderUrl || '', driveSheetUrl: r.sheetUrl || '' }); }
+    try { const r = await postDrive({ action: 'ping' }); out.innerHTML = `Connected. Folder: <a href="${esc(r.folderUrl)}" target="_blank" rel="noopener">open</a> · Database sheet: <a href="${esc(r.sheetUrl)}" target="_blank" rel="noopener">open</a>`; await S.store.saveDrive({ driveUrl: S.settings.driveUrl, driveKey: S.settings.driveKey, driveAuto: S.settings.driveAuto !== false, driveFolderUrl: r.folderUrl || '', driveSheetUrl: r.sheetUrl || '' }); }
     catch (e) { out.innerHTML = `<span class="err">${esc(e.message || String(e))}</span>`; }
   },
   'search-all': () => openSearch(),
@@ -2134,7 +2175,7 @@ async function openImportPreview(date, target, hm) {
       </div>
       ${IMP.missing.length ? `<div class="panel"><h4>${IMP.missing.length} patient${IMP.missing.length === 1 ? ' is' : 's are'} in the app but not in the file</h4>
         <div class="help" style="margin-bottom:8px">${IMP.missing.map(e => esc(`${e.bed} ${e.name}`)).join(' · ')}</div>
-        <div class="opt-row"><button class="opt on" data-action="imp-missing" data-v="keep">Keep them</button><button class="opt" data-action="imp-missing" data-v="remove">Remove them from this handover</button></div></div>` : ''}
+        ${isAdmin() ? `<div class="opt-row"><button class="opt on" data-action="imp-missing" data-v="keep">Keep them</button><button class="opt" data-action="imp-missing" data-v="remove">Remove them from this handover</button></div>` : '<p class="help">They stay on this handover. Only the admin can remove patients.</p>'}</div>` : ''}
       <div class="panel"><h4>Patients</h4>${IMP.plan.map(p => `<div class="imp-row"><div class="bedbox" style="--c:${esc(bedColor(p.e.bed))}">${esc(p.e.bed || '—')}</div><div class="u"><b>${esc(p.e.name)}</b>${p.e.age ? ` <span class="help">${esc(p.e.age)}</span>` : ''}<div class="help">${p.fields.length && p.status === 'updated' ? 'Changed: ' + p.fields.map(k => esc(FIELD_LABELS[k] || k)).join(', ') : esc(htmlToText(p.e.diagnosis).slice(0, 90))}</div></div>${badge[p.status]}</div>`).join('')}</div>
     </div>`);
   IMP.removeMissing = false;
@@ -2174,6 +2215,17 @@ function rowOf(sid, e) {
   return [date, fmtClock(sidHM(sid)), e.interim ? 'Came and left' : 'On handover', e.bed, e.name, e.age, e.uhid || '', e.doa || '', e.micuDate || '', day, e.consultant || '', e.source || '', e.referral || '',
     htmlToText(e.diagnosis), htmlToText(e.investigations), htmlToText(e.history), htmlToText(e.plan), htmlToText(e.drugs),
     (OUTCOMES.find(o => o.id === e.outcome) || {}).label || e.outcome, (e.interim ? `Came ${fmtDT(e.inAt)}, left ${fmtDT(e.outAt)}. ` : '') + (e.outcomeNote || ''), pendingTasks(e).join('; '), e.updatedBy || '', e.updatedAt ? new Date(e.updatedAt).toISOString() : '', e.id].map(safeCell);
+}
+// older versions kept the Drive key in the shared settings; move it to the admin-only document
+async function migrateDrive() {
+  if (!isAdmin() || !S.driveLoaded || !S.legacyDrive || S.migratingDrive) return;
+  S.migratingDrive = true;
+  try {
+    const add = {}; Object.entries(S.legacyDrive).forEach(([k, v]) => { if (S.drive[k] === undefined || S.drive[k] === '') add[k] = v; });
+    if (Object.keys(add).length) await S.store.saveDrive(add);
+    await S.store.clearLegacyDrive(); S.legacyDrive = null;
+  } catch (e) { console.warn('drive move', e); }
+  S.migratingDrive = false;
 }
 function blobToB64(blob) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1] || ''); r.onerror = rej; r.readAsDataURL(blob); }); }
 async function postDrive(payload) {
@@ -2354,6 +2406,166 @@ function downloadCsv(kind) {
 }
 
 /* =================================================================
+   SECURITY: app lock (PIN + Face ID / fingerprint) and wiping this device
+   ================================================================= */
+const LOCK_KEY = 'handover-lock', REG_KEY = 'handover-device-reg', WIPED_KEY = 'handover-wiped';
+const LOCK = { unlocked: false, last: Date.now(), hiddenAt: 0, wired: false };
+const lsGet = k => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); return true; } catch { return false; } };
+const lsDel = k => { try { localStorage.removeItem(k); } catch { } };
+const lockOn = () => !DEMO || !!CFG.lockInDemo || lsGet('handover-lock-test') === '1';
+function lockCfg() { try { const c = JSON.parse(lsGet(LOCK_KEY) || 'null'); return c && S.user && c.uid === S.user.uid ? c : null; } catch { return null; } }
+const saveLockCfg = c => lsSet(LOCK_KEY, JSON.stringify(c));
+const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64u = str => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+async function pinHash(pin, salt) { return b64u(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + ':' + pin))); }
+const bioLabel = () => /iPhone|iPad/.test(navigator.userAgent) ? 'Face ID / Touch ID' : /Mac/.test(navigator.userAgent) ? 'Touch ID' : 'fingerprint / face unlock';
+async function bioAvailable() { try { return !!(window.PublicKeyCredential && window.isSecureContext && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); } catch { return false; } }
+async function bioRegister() {
+  const cred = await navigator.credentials.create({ publicKey: {
+    challenge: rand(32), rp: { name: CFG.appName || 'MICU HANDOVER' },
+    user: { id: new TextEncoder().encode(S.user.uid).slice(0, 64), name: S.user.email || 'user', displayName: (S.profile && S.profile.name) || S.user.email || 'user' },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+    authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' }, timeout: 60000, attestation: 'none' } });
+  return b64u(cred.rawId);
+}
+async function bioCheck(id) {
+  await navigator.credentials.get({ publicKey: { challenge: rand(32), allowCredentials: [{ type: 'public-key', id: unb64u(id), transports: ['internal', 'hybrid'] }], userVerification: 'required', timeout: 60000 } });
+  return true;
+}
+const lockMinutes = c => (c && c.minutes !== undefined ? +c.minutes : 5);
+
+// Lock / set-PIN screen. mode: 'unlock' | 'set' | 'change'
+function pinPad(mode, done) {
+  let r = document.getElementById('lock-root');
+  if (!r) { r = document.createElement('div'); r.id = 'lock-root'; document.body.appendChild(r); }
+  let step = mode === 'change' ? 'verify' : mode === 'set' ? 'new' : 'unlock', first = '', pin = '', busy = false;
+  const title = () => ({ unlock: 'Enter your PIN', verify: 'Enter your current PIN', new: 'Choose a 4-digit PIN', again: 'Enter the same PIN again' })[step];
+  const sub = () => step === 'new' ? 'This PIN opens the app on this device. Do not use your phone PIN.' : step === 'again' ? '&nbsp;' : esc((S.profile && S.profile.name) || '');
+  const draw = (err = '') => {
+    const cfg = lockCfg(), bio = step === 'unlock' && cfg && cfg.bio;
+    r.innerHTML = `<div class="lock-screen"><div class="lock-card">
+      <div class="auth-logo">${icon('lock')}</div><h2>${esc(title())}</h2><p class="help">${sub()}</p>
+      <div class="pin-dots">${[0, 1, 2, 3].map(i => `<i class="${i < pin.length ? 'on' : ''}"></i>`).join('')}</div>
+      <div class="pin-err" role="alert">${esc(err)}</div>
+      <div class="keypad">${[1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => `<button type="button" data-k="${n}">${n}</button>`).join('')}
+        <span></span><button type="button" data-k="0">0</button><button type="button" data-k="del" aria-label="Delete">⌫</button></div>
+      ${bio ? `<button type="button" class="btn soft block" data-k="bio" style="margin-top:14px">Use ${esc(bioLabel())}</button>` : ''}
+      ${step === 'unlock' ? `<button type="button" class="link-btn" data-k="forgot">Forgot PIN? Sign out</button>` : mode === 'change' ? `<button type="button" class="link-btn" data-k="cancel">Cancel</button>` : ''}
+    </div></div>`;
+  };
+  const close = () => { r.innerHTML = ''; document.removeEventListener('keydown', onKey, true); };
+  const finishUnlock = () => { const c = lockCfg(); if (c && c.fails) { c.fails = 0; saveLockCfg(c); } LOCK.unlocked = true; LOCK.last = Date.now(); close(); done && done(); };
+  const full = async () => {
+    busy = true;
+    try {
+      if (step === 'unlock' || step === 'verify') {
+        const c = lockCfg();
+        if (c && await pinHash(pin, c.salt) === c.hash) { if (step === 'verify') { step = 'new'; pin = ''; draw(); return; } finishUnlock(); return; }
+        if (c) { c.fails = (c.fails || 0) + 1; saveLockCfg(c); }
+        const left = 5 - ((c && c.fails) || 0); pin = '';
+        if (left <= 0) { close(); wipeDevice('pin'); return; }
+        draw(`Wrong PIN. ${left} ${left === 1 ? 'try' : 'tries'} left, then this device is cleared and signed out.`); return;
+      }
+      if (step === 'new') { first = pin; pin = ''; step = 'again'; draw(); return; }
+      if (step === 'again') {
+        if (pin !== first) { step = 'new'; pin = ''; first = ''; draw('The two PINs were different. Try again.'); return; }
+        const old = lockCfg() || {}, salt = b64u(rand(16));
+        saveLockCfg({ uid: S.user.uid, salt, hash: await pinHash(pin, salt), minutes: lockMinutes(old), bio: old.bio || '', fails: 0 });
+        LOCK.unlocked = true; LOCK.last = Date.now(); close();
+        if (mode === 'set' && await bioAvailable() && await ask(`PIN saved. Also unlock with ${bioLabel()}?`, { ok: 'Yes, use it', cancel: 'Not now' })) await turnBioOn();
+        else toast(mode === 'change' ? 'PIN changed' : 'PIN saved');
+        done && done();
+      }
+    } finally { busy = false; }
+  };
+  const press = k => {
+    if (busy) return;
+    if (k === 'del') { pin = pin.slice(0, -1); draw(); return; }
+    if (k === 'forgot') { ask('Sign out and clear this device? You will sign in again with your email and password, then choose a new PIN.', { ok: 'Sign out', danger: true }).then(ok => { if (ok) { close(); wipeDevice('forgot'); } }); return; }
+    if (k === 'cancel') { close(); return; }
+    if (k === 'bio') { const c = lockCfg(); if (c && c.bio) bioCheck(c.bio).then(finishUnlock).catch(e => { console.warn('bio', e); draw('Could not check ' + bioLabel() + '. Use your PIN.'); }); return; }
+    if (/^\d$/.test(k) && pin.length < 4) { pin += k; draw(); if (pin.length === 4) setTimeout(full, 120); }
+  };
+  const onKey = ev => { if ($('#ask-root').innerHTML) return; if (/^\d$/.test(ev.key)) { press(ev.key); ev.preventDefault(); } else if (ev.key === 'Backspace') { press('del'); ev.preventDefault(); } };
+  r.onclick = ev => { const b = ev.target.closest('[data-k]'); if (b) press(b.dataset.k); };
+  document.addEventListener('keydown', onKey, true);
+  draw();
+}
+async function turnBioOn() {
+  try { const id = await bioRegister(); const c = lockCfg(); if (c) { c.bio = id; saveLockCfg(c); } toast(bioLabel() + ' is on'); }
+  catch (e) { console.warn('bio', e); toast('Could not turn on ' + bioLabel()); }
+}
+function lockNow() { if (!lockOn() || !lockCfg() || !S.user) return; LOCK.unlocked = false; if (!document.querySelector('#lock-root .lock-screen')) pinPad('unlock'); }
+function ensureLock() {
+  if (!lockOn() || !S.user) return;
+  if (!LOCK.wired) {
+    LOCK.wired = true;
+    ['pointerdown', 'keydown', 'touchstart', 'wheel'].forEach(ev => document.addEventListener(ev, () => { LOCK.last = Date.now(); }, { passive: true, capture: true }));
+    document.addEventListener('visibilitychange', () => {
+      const c = lockCfg(); if (!c || !LOCK.unlocked) return;
+      if (document.hidden) LOCK.hiddenAt = Date.now();
+      else if (LOCK.hiddenAt && Date.now() - LOCK.hiddenAt >= lockMinutes(c) * 60e3) lockNow();
+    });
+    setInterval(() => { const c = lockCfg(); if (c && LOCK.unlocked && S.user && Date.now() - LOCK.last >= Math.max(1, lockMinutes(c)) * 60e3) lockNow(); }, 15000);
+  }
+  if (document.querySelector('#lock-root .lock-screen')) return;
+  if (!lockCfg()) { pinPad('set'); return; }
+  if (!LOCK.unlocked) pinPad('unlock');
+}
+function lockPanel() {
+  if (!lockOn()) return '';
+  const c = lockCfg(); if (!c) return '';
+  const opts = [['0', 'As soon as I leave the app'], ['1', 'After 1 minute'], ['5', 'After 5 minutes'], ['15', 'After 15 minutes']];
+  return `<div class="panel"><h4>App lock (this device)</h4>
+    <label class="field"><span>Lock the app</span><select class="input" id="lockMin">${opt(opts, String(lockMinutes(c)))}</select></label>
+    <div class="opt-row" style="margin-top:10px"><button class="btn" data-action="pin-change">Change PIN</button>
+    <button class="btn" data-action="bio-toggle" id="bioBtn" style="display:none">${c.bio ? 'Turn off ' : 'Use '}${esc(bioLabel())}</button>
+    <button class="btn" data-action="lock-now">${icon('lock')} Lock now</button></div>
+    <p class="help">5 wrong PINs clear this device and sign out. The app also locks after the same time without use.</p></div>`;
+}
+function wireLockPanel() {
+  const sel = $('#lockMin'); if (sel) sel.onchange = () => { const c = lockCfg(); if (c) { c.minutes = +sel.value; saveLockCfg(c); toast('Saved'); } };
+  const b = $('#bioBtn'); if (b) bioAvailable().then(ok => { if (ok) b.style.display = ''; });
+}
+
+// Clear everything this device holds, sign out, start fresh
+function markRegistered() { if (S.user) lsSet(REG_KEY, S.user.uid); }
+const wasRegistered = () => !!S.user && lsGet(REG_KEY) === S.user.uid;
+function shouldWipe(p) {
+  if (!wasRegistered()) return '';
+  if (!p) return 'removed';
+  if (p.status === 'blocked') return 'blocked';
+  if (p.status === 'approved' && !deviceInList(p)) return 'removed';
+  return '';
+}
+let wiping = false;
+async function wipeDevice(reason) {
+  if (wiping) return; wiping = true;
+  try { sessionStorage.setItem(WIPED_KEY, reason || 'signout'); } catch { }
+  render(`<div class="loading"><div class="spinner"></div></div>`);
+  ['#modal-root', '#dialog-root', '#ask-root'].forEach(id => { const el = $(id); if (el) el.innerHTML = ''; });
+  [LOCK_KEY, REG_KEY].forEach(lsDel);
+  lsSet('handover-wipe-pending', '1');
+  try { await S.store.wipe(); lsDel('handover-wipe-pending'); } catch (e) { console.warn('wipe', e); }
+  location.reload();
+}
+async function wipeLeftovers() {
+  // runs before Firebase starts, when a wipe could not finish last time
+  if (lsGet('handover-wipe-pending') !== '1') return;
+  lsDel('handover-wipe-pending');
+  try {
+    const dbs = indexedDB.databases ? await indexedDB.databases() : [];
+    const names = new Set(dbs.map(d => d.name).filter(n => /firestore|firebase/i.test(n || '')));
+    if (CFG.firebase && CFG.firebase.projectId) names.add(`firestore/[DEFAULT]/${CFG.firebase.projectId}/main`);
+    names.add('firebaseLocalStorageDb');
+    await Promise.all([...names].map(n => new Promise(res => { const q = indexedDB.deleteDatabase(n); q.onsuccess = q.onerror = q.onblocked = () => res(); })));
+  } catch (e) { console.warn('leftovers', e); }
+}
+const WIPE_MSG = { removed: 'This device was removed from your account, so its data was cleared. Sign in again if you still use it.', blocked: 'Your account was blocked by the admin. Data on this device was cleared.', pin: 'Too many wrong PINs. Data on this device was cleared. Sign in again with your email and password.', forgot: 'Signed out and cleared. Sign in again, then choose a new PIN.', signout: 'Signed out. Data on this device was cleared.' };
+
+/* =================================================================
    DEVICES (max 2 per person, admin unlimited)
    ================================================================= */
 const DEV_KEY = 'handover-device-id';
@@ -2378,10 +2590,11 @@ async function registerDevice() {
   const list = (p.devices || []).slice(), me = myDeviceId(), now = Date.now();
   const i = list.findIndex(d => d.id === me);
   if (i >= 0) {
+    markRegistered();
     if (now - (list[i].lastSeen || 0) > 6 * 3600e3) { list[i] = { ...list[i], lastSeen: now, name: deviceName() }; p.devices = list; S.store.setUser(p.uid, { devices: list }).catch(e => console.warn('device', e)); }
     return;
   }
-  if (!limitApplies(p) || list.length < maxDevices()) { list.push({ id: me, name: deviceName(), addedAt: now, lastSeen: now }); p.devices = list; await settle(S.store.setUser(p.uid, { devices: list }), 2500); }
+  if (!limitApplies(p) || list.length < maxDevices()) { list.push({ id: me, name: deviceName(), addedAt: now, lastSeen: now }); p.devices = list; await settle(S.store.setUser(p.uid, { devices: list }), 2500); markRegistered(); }
 }
 function deviceRows(list, opts = {}) {
   return (list || []).map(d => `<div class="user-row"><div class="u"><b>${esc(d.name || 'Device')}${d.id === myDeviceId() ? ' <span class="st approved">this device</span>' : ''}</b><small>Added ${esc(fmtTime(d.addedAt))} · last used ${esc(fmtTime(d.lastSeen))}</small></div>
@@ -2420,7 +2633,7 @@ async function removeDevice(id, uid) {
 function driveTab() {
   const st = S.settings;
   return `<div class="panel"><h4>Google Drive archive</h4>
-      <p class="help" style="margin:0 0 10px">Each handover (morning and evening) is saved to your Google Drive as DOCX and JSON, and every patient on it is added as a row in one Google Sheet ("MICU HANDOVER Database"). Set it up once from a laptop: see <b>drive/Code.gs</b> and README.</p>
+      <p class="help" style="margin:0 0 10px">Each handover is saved to your Google Drive as DOCX and JSON, and every patient on it is added as a row in one Google Sheet ("MICU HANDOVER Database"). Set it up once from a laptop: see <b>drive/Code.gs</b> and README.</p>
       <label class="field"><span>Apps Script web app URL</span><input class="input" id="drvUrl" value="${esc(st.driveUrl || '')}" placeholder="https://script.google.com/macros/s/…/exec" autocomplete="off"></label>
       <label class="field"><span>Secret key (same as in Code.gs)</span><input class="input" id="drvKey" value="${esc(st.driveKey || '')}" autocomplete="off"></label>
       <div class="opt-row" style="margin-bottom:12px"><button class="opt ${st.driveAuto !== false ? 'on' : ''}" data-action="drv-auto" data-v="1">Save past days automatically</button><button class="opt ${st.driveAuto === false ? 'on' : ''}" data-action="drv-auto" data-v="0">Only when I tap</button></div>
