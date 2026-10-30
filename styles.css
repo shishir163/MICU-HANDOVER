@@ -364,3 +364,18 @@ details.panel>summary b{font-weight:900}
 .keypad button{height:62px;border-radius:18px;border:1px solid var(--border);background:var(--surface);color:var(--text);font:inherit;font-size:1.5em;font-weight:700;cursor:pointer;box-shadow:var(--shadow)}
 .keypad button:active{background:var(--primary-soft)}
 .link-btn{background:none;border:none;color:var(--muted);font:inherit;font-size:.9em;margin-top:16px;cursor:pointer;text-decoration:underline}
+
+/* v3.7: investigation rows, tag search, drug gap */
+.inv-row{display:flex;gap:8px;align-items:flex-start;margin-bottom:6px}
+.inv-row .inv-k{flex:0 0 38%;max-width:200px;font-weight:800;font-size:.86em;padding-top:11px;word-break:break-word}
+.inv-row input.inv-k{padding-top:0;font-weight:700;max-width:none}
+.inv-row .inv-v{flex:1;min-height:42px;resize:vertical;line-height:1.35;font-size:.95em}
+.inv-free{margin-top:10px}
+.tag-find{margin:6px 0;min-height:38px;font-size:.88em}
+.ps-table .drug-gap{height:1.7em}
+
+/* v3.8: staff list, shared station */
+.staff-row{border:1px solid var(--line,rgba(128,128,128,.25));border-radius:14px;padding:12px;margin-bottom:12px}
+.staff-row .btn.danger{margin-top:8px}
+.station-bar{background:var(--primary);color:#fff;padding:8px 14px;font-size:.84em;text-align:center}
+.user-row small{margin-right:6px}

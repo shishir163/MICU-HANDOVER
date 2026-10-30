@@ -3,7 +3,7 @@
 
 const CFG = window.HANDOVER_CONFIG || {};
 const DEMO = !(CFG.firebase && CFG.firebase.apiKey) || !!CFG.forceDemo;
-const APP_VERSION = '3.6.0';
+const APP_VERSION = '3.8.0';
 
 /* ---------------- small helpers ---------------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -87,8 +87,9 @@ const DEFAULT_SOURCES = ['ER', 'WARD/CABIN'];
 const DEFAULT_DX_TAGS = ['SEPSIS', 'SEPTIC SHOCK', 'B/L PNEUMONIA', 'ASPIRATION PNEUMONIA', 'ARDS', 'TYPE 1 RF', 'TYPE 2 RF', 'AKI', 'CKD', 'DKA', 'DM', 'HTN', 'IHD', 'CHRONIC AF', 'COPD', 'BRONCHIAL ASTHMA', 'STROKE', 'HEAD INJURY', 'DENGUE SHOCK SYNDROME', 'UROSEPSIS', 'CARDIOGENIC SHOCK', 'HYPONATRAEMIA', 'HYPOKALAEMIA', 'HYPOTHYROIDISM', 'MODS', 'METABOLIC ACIDOSIS'];
 const DEFAULT_ABX_TAGS = ['MERO', 'MOXI', 'LEVO', 'CEFTAZIDIME-AVIBACTAM', 'COLISTIN', 'TIGECYCLINE', 'CLINDA', 'PIP-TAZO', 'VANCO', 'LINEZOLID', 'CEFTRIAXONE', 'AZITHRO', 'METRO'];
 const DEFAULT_DRUG_TAGS = ['CLEXANE', 'LASIX', 'ASPIRIN', 'CLOPID', 'DIGOXIN', 'THYROX', 'AMIODARONE', 'PANTO', 'INSULIN', 'NORAD'];
-const DEFAULT_SETTINGS = () => ({ beds: (CFG.defaultBeds || []).slice(), categories: clone(DEFAULT_CATEGORIES), sources: DEFAULT_SOURCES.slice(), consultants: [], dxTags: DEFAULT_DX_TAGS.slice(), abxTags: DEFAULT_ABX_TAGS.slice(), drugTags: DEFAULT_DRUG_TAGS.slice() });
-const RICH_FIELDS = ['diagnosis', 'investigations', 'history', 'plan', 'drugs'];
+const DEFAULT_SETTINGS = () => ({ beds: (CFG.defaultBeds || []).slice(), categories: clone(DEFAULT_CATEGORIES), sources: DEFAULT_SOURCES.slice(), consultants: [], dxTags: DEFAULT_DX_TAGS.slice(), abxTags: DEFAULT_ABX_TAGS.slice(), drugTags: DEFAULT_DRUG_TAGS.slice(), invNames: DEFAULT_INV_NAMES.slice() });
+const DEFAULT_INV_NAMES = ['ECHO', 'BLOOD C/S', 'URINE C/S', 'TRACHEAL C/S', 'RESP. PANEL PCR', 'BIOFIRE', 'USG'];
+const RICH_FIELDS = ['diagnosis', 'investigations', 'history', 'plan', 'antibiotics', 'drugs'];
 const isAdminEmail = e => (CFG.adminEmails || []).map(x => x.toLowerCase()).includes(String(e || '').toLowerCase());
 
 /* ---------------- prefs (per device) ---------------- */
@@ -98,12 +99,15 @@ function loadPrefs() { try { return { ...DEFAULT_PREFS, ...JSON.parse(localStora
 
 /* ---------------- state ---------------- */
 const S = {
-  store: null, user: null, profile: null, settings: DEFAULT_SETTINGS(),
+  store: null, user: null, profile: null, settings: DEFAULT_SETTINGS(), staff: [], usersCache: [],
   date: todayISO(), sid: null, sheetList: [], listReady: false, sheet: undefined, entries: [], prevInfo: null,
   prefs: loadPrefs(), search: '', subs: [], sheetUnsub: null, mainOn: false, online: navigator.onLine
 };
 const DRIVE_FIELDS = ['driveUrl', 'driveKey', 'driveAuto', 'driveFolderUrl', 'driveSheetUrl'];
 const isAdmin = () => S.profile && S.profile.role === 'admin' && S.profile.status === 'approved';
+const isSub = () => !!S.profile && S.profile.role === 'sub' && S.profile.status === 'approved';
+const isStaffAdmin = () => isAdmin() || isSub();
+const roleLabel = r => r === 'admin' ? 'Admin' : r === 'sub' ? 'Sub-admin' : 'Medical officer';
 const catOf = () => ({ id: 'other', name: '', color: 'var(--primary)' });
 const catOfOld = id => S.settings.categories.find(c => c.id === id) || S.settings.categories.find(c => c.id === 'other') || { id: 'other', name: 'Other', color: '#64748b' };
 
@@ -140,6 +144,8 @@ class DemoStore {
   watchSettings(cb) { const f = () => cb(this.mem.settings || null); f(); this.listeners.add(f); return () => this.listeners.delete(f); }
   watchDrive(cb) { const f = () => cb(this.mem.drive || null); f(); this.listeners.add(f); return () => this.listeners.delete(f); }
   async saveDrive(d) { this.mem.drive = { ...(this.mem.drive || {}), ...clone(d) }; this.persist(); }
+  watchStaff(cb) { const f = () => cb(this.mem.staff || null); f(); this.listeners.add(f); return () => this.listeners.delete(f); }
+  async saveStaff(list) { this.mem.staff = { list: clone(list) }; this.persist(); }
   async clearLegacyDrive() { if (this.mem.settings) DRIVE_FIELDS.forEach(k => delete this.mem.settings[k]); this.persist(); }
   async saveSettings(s) { this.mem.settings = { ...(this.mem.settings || {}), ...clone(s) }; this.persist(); }
   watchSheet(sid, cb) {
@@ -249,6 +255,9 @@ class FirebaseStore {
   // Drive link + secret key: admin-only document
   watchDrive(cb) { return this.fb.onSnapshot(this.fb.doc(this.db, 'settings', 'drive'), s => cb(s.exists() ? s.data() : null), e => console.warn('drive settings', e)); }
   saveDrive(d) { return this.fb.setDoc(this.fb.doc(this.db, 'settings', 'drive'), clone(d), { merge: true }); }
+  // Staff list (names, Hospital IDs, emails): admin and sub-admins only
+  watchStaff(cb) { return this.fb.onSnapshot(this.fb.doc(this.db, 'settings', 'staff'), s => cb(s.exists() ? s.data() : null), e => console.warn('staff list', e)); }
+  saveStaff(list) { return this.fb.setDoc(this.fb.doc(this.db, 'settings', 'staff'), { list: clone(list), updatedAt: Date.now() }); }
   clearLegacyDrive() { const del = this.fb.deleteField(); return this.fb.updateDoc(this.fb.doc(this.db, 'settings', 'main'), Object.fromEntries(DRIVE_FIELDS.map(k => [k, del]))); }
   sref(date) { return this.fb.doc(this.db, 'sheets', date); }
   eref(date, id) { return this.fb.doc(this.db, 'sheets', date, 'entries', id); }
@@ -461,7 +470,7 @@ function route() {
       if ((S.profile.devices || []).length < maxDevices()) { registerDevice().then(route).catch(e => renderFatal('Could not register this device.', e)); return; }
       stopMain(); return renderDevices();
     }
-    startMain(); ensureLock(); return;
+    startMain(); ensureLock(); startStationTimer(); return;
   }
   stopMain();
   if (st === 'unverified') return renderVerify();
@@ -546,6 +555,7 @@ function startMain() {
         if (S.settings.categories?.length === 0) S.settings.categories = clone(DEFAULT_CATEGORIES);
         migrateDrive(); renderSheetArea(); setTimeout(autoArchive, 4000);
       }),
+      ...(isStaffAdmin() ? [S.store.watchStaff(d => { S.staff = (d && d.list) || []; })] : []),
       ...(isAdmin() ? [S.store.watchDrive(d => { S.drive = d || {}; S.driveLoaded = true; Object.assign(S.settings, S.drive); migrateDrive(); })] : []),
       S.store.watchSheetList(list => {
         S.sheetList = list || [];
@@ -573,6 +583,7 @@ function renderShell() {
     <button class="icon-btn" data-action="menu" aria-label="Export, import and more">${icon('more')}</button>
     <button class="icon-btn" data-action="settings" aria-label="Settings">${icon('gear')}</button>
   </header>
+  ${isStation() ? `<div class="station-bar"><b>Shared computer.</b> Please sign out when you finish. It signs out by itself after 15 minutes of no use.</div>` : ''}
   ${DEMO ? `<div class="demo-banner"><b>Demo mode.</b> Firebase is not set up yet, so data stays on this device only. Patients shown are made-up examples.</div>` : ''}
   <div class="wrap">
     <div class="datebar">
@@ -670,7 +681,7 @@ function renderSheetArea() {
 function searchBlob(e) {
   if (e._blob) return e._blob;
   const c = catOf(e.category);
-  return (e._blob = [e.bed, e.name, e.age, e.uhid, e.consultant, e.referral, e.source, c.name, ...RICH_FIELDS.map(f => htmlToText(e[f]))].join(' \n ').toLowerCase());
+  return (e._blob = [e.bed, e.name, e.age, e.uhid, e.consultant, e.referral, e.source, c.name, ...RICH_FIELDS.map(f => htmlToText(e[f])), invText(e)].join(' \n ').toLowerCase());
 }
 function sortEntries(list) {
   const beds = S.settings.beds, bi = b => { const i = beds.indexOf(b); return i < 0 ? 999 : i; };
@@ -680,10 +691,48 @@ function sortEntries(list) {
   return list.sort(byBed);
 }
 function icuDay(e) { return validISO(e.micuDate) ? diffDays(e.micuDate, S.date) + 1 : null; }
+/* ---------- A-Z, antibiotics / other drugs, investigation rows ---------- */
+const azSort = arr => (arr || []).slice().sort((x, y) => String(x).localeCompare(String(y), 'en', { sensitivity: 'base', numeric: true }));
+const ABX_WORDS = ['MERO', 'MEROPENEM', 'MEROPEN', 'MOXI', 'LEVO', 'CIPRO', 'CEFTAZIDIME', 'CEFTRIAXONE', 'CEFEPIME', 'CEFIXIME', 'CEFUROXIME', 'CEFOPERAZONE', 'CEFTAROLINE', 'ZAVICEFTA', 'AVYCEF', 'COLISTIN', 'COLISTIMETHATE', 'POLYMYXIN', 'TIGECYCLINE', 'CLINDA', 'PIP-TAZO', 'PIPTAZ', 'TAZOCIN', 'VANCO', 'TEICOPLANIN', 'LINEZOLID', 'AZITHRO', 'CLARITHRO', 'DOXY', 'METRO', 'AMOXICLAV', 'AUGMENTIN', 'AMPICILLIN', 'CLOXACILLIN', 'FLUCLOXACILLIN', 'COTRIMOXAZOLE', 'FOSFOMYCIN', 'ERTAPENEM', 'IMIPENEM', 'DORIPENEM', 'SULBACTAM', 'AMIKACIN', 'GENTAMICIN', 'CHLORAMPHENICOL', 'RIFAMPICIN', 'FLUCONAZOLE', 'MICAFUNGIN', 'VORICONAZOLE', 'AMPHOTERICIN'];
+const ABX_RE = /(^|[\s,;/(+-])(CEF[A-Z]*|CEPH[A-Z]*|[A-Z]*MYCIN|[A-Z]*MICIN|[A-Z]*CILLIN|[A-Z]*FLOXACIN|[A-Z]*PENEM|[A-Z]*CYCLINE|[A-Z]*BACTAM)($|[\s,;/.)+-])/i;
+function isAbxLine(text) {
+  const t = String(text || '').toUpperCase().trim(); if (!t) return false;
+  if (ABX_RE.test(t)) return true;
+  const extra = ((typeof S !== 'undefined' && S.settings && S.settings.abxTags) || []);
+  return [...ABX_WORDS, ...extra].some(w => w && hasWord(t, String(w).toUpperCase()));
+}
+// old sheets kept every drug in one box; split the lines into antibiotics and other drugs
+function htmlLines(html) {
+  const s = String(html || '').replace(/<\/(div|p)>\s*/gi, '<br>').replace(/<(div|p)(\s[^>]*)?>/gi, '<br>');
+  return s.split(/<br\s*\/?>/i).map(p => { const d = document.createElement('div'); d.innerHTML = p; return d.innerHTML; }).filter(p => htmlToText(p));
+}
+function splitDrugLines(drugsHtml) {
+  const lines = htmlLines(drugsHtml), abx = [], other = [];
+  let stop = lines.findIndex(l => /^H\/O/i.test(htmlToText(l)));
+  if (stop < 0) stop = lines.length;
+  lines.forEach((l, i) => { if (i < stop && isAbxLine(htmlToText(l))) abx.push(l); else other.push(l); });
+  return { abx: abx.join('<br>'), other: other.join('<br>') };
+}
+function drugParts(e) {
+  if (e.antibiotics !== undefined && e.antibiotics !== null) return { abx: e.antibiotics || '', other: e.drugs || '' };
+  const p = splitDrugLines(e.drugs); return p;
+}
+// antibiotics, one blank line, then the other drugs
+function drugsHtml(e) { const p = drugParts(e); return [p.abx, p.other].filter(x => htmlToText(x)).join('<div class="drug-gap">&nbsp;</div>'); }
+function drugsText(e) { const p = drugParts(e); return [htmlToText(p.abx), htmlToText(p.other)].filter(Boolean).join('\n'); }
+// investigation rows: only the ones with a result are printed
+const invFilled = e => (e.invs || []).filter(r => r && r.k && String(r.v || '').trim());
+function invHtml(e) {
+  const rows = invFilled(e).map(r => `<div><b>${esc(r.k)}:</b> ${esc(String(r.v).trim()).replace(/\n/g, '<br>')}</div>`).join('');
+  return rows + (htmlToText(e.investigations) ? (e.investigations || '') : '');
+}
+function invText(e) { return [...invFilled(e).map(r => `${r.k}: ${String(r.v).trim()}`), htmlToText(e.investigations)].filter(Boolean).join('\n'); }
 function drugChips(e) {
-  const t = htmlToText(e.drugs).split('\n').map(x => x.trim()).filter(Boolean);
+  const p = drugParts(e);
+  const a = htmlToText(p.abx).split('\n').map(x => x.trim()).filter(Boolean);
+  const t = htmlToText(p.other).split('\n').map(x => x.trim()).filter(Boolean);
   const stop = t.findIndex(x => /^H\/O/i.test(x));
-  return (stop >= 0 ? t.slice(0, stop) : t).slice(0, 8);
+  return [...a, ...(stop >= 0 ? t.slice(0, stop) : t)].slice(0, 8);
 }
 const CARD_HUES = ['#3b82f6', '#ec4899', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ef4444', '#84cc16', '#6366f1', '#f97316', '#14b8a6', '#d946ef', '#0ea5e9', '#eab308', '#22c55e', '#a855f7'];
 function bedColor(bed) {
@@ -799,15 +848,15 @@ function cprEventDialog(ev, defDate, onSave, onDelete) {
   };
   const d = r.querySelector('[data-cx="del"]'); if (d) d.onclick = () => { close(); onDelete && onDelete(c); };
 }
-function wireCprBox(box, list, defDate) {
+function wireCprBox(box, list, defDate, onNoRosc) {
   const draw = () => {
     box.querySelector('.cpr-list').innerHTML = cprListHtml(list);
     box.querySelectorAll('[data-cpr-id]').forEach(b => b.onclick = () => {
       const ev = list.find(x => x.id === b.dataset.cprId);
-      cprEventDialog(ev, defDate, nv => { Object.assign(ev, nv); draw(); }, () => { list.splice(list.indexOf(ev), 1); draw(); });
+      cprEventDialog(ev, defDate, nv => { Object.assign(ev, nv); draw(); if (nv.rosc === 'no' && onNoRosc) onNoRosc(nv); }, () => { list.splice(list.indexOf(ev), 1); draw(); });
     });
   };
-  box.querySelector('.cpr-add').onclick = () => cprEventDialog(null, typeof defDate === 'function' ? defDate() : defDate, nv => { list.push(nv); draw(); });
+  box.querySelector('.cpr-add').onclick = () => cprEventDialog(null, typeof defDate === 'function' ? defDate() : defDate, nv => { list.push(nv); draw(); if (nv.rosc === 'no' && onNoRosc) onNoRosc(nv); });
   draw();
 }
 const cprBoxHtml = () => `<div class="cpr-box"><div class="cpr-list"></div><button type="button" class="btn cpr-add">${icon('plus')} CPR given</button></div>`;
@@ -836,7 +885,7 @@ function interimForm(e, { onSave, onDelete } = {}) {
     </div></div></div></div>`;
   const close = () => { r.innerHTML = ''; };
   const cprList = clone(e.cpr || []);
-  wireCprBox($('#if_cpr'), cprList, () => ($('#if_in').value || nowLocal()).slice(0, 10));
+  wireCprBox($('#if_cpr'), cprList, () => ($('#if_in').value || nowLocal()).slice(0, 10), () => { const s = $('#if_out_k'); if (s && s.value !== 'death') { s.value = 'death'; toast('No ROSC — "Why left" set to Death'); } });
   r.querySelector('[data-ifx="close"]').onclick = close;
   r.querySelector('[data-ifx="save"]').onclick = () => {
     const v = id => $('#' + id).value.trim();
@@ -994,10 +1043,22 @@ function closeModal() { const r = $('#modal-root'); if (r) r.innerHTML = ''; doc
 
 /* ---------------- entry editor ---------------- */
 let rteLast = null, rteRange = null;
+function invRowHtml(k, v, custom) {
+  return `<div class="inv-row" ${custom ? 'data-custom="1"' : ''}>${custom ? `<input class="input inv-k" value="${esc(k)}" placeholder="Test name" autocapitalize="characters">` : `<span class="inv-k">${esc(k)}</span>`}<textarea class="input inv-v" rows="1" placeholder="result">${esc(v || '')}</textarea>${custom ? `<button type="button" class="icon-btn" data-action="inv-del" aria-label="Remove">${icon('x')}</button>` : ''}</div>`;
+}
+function invRowsHtml(e) {
+  const names = ((S.settings && S.settings.invNames) || DEFAULT_INV_NAMES).map(x => String(x).toUpperCase());
+  const have = new Map((e.invs || []).map(x => [String(x.k).toUpperCase(), x.v]));
+  const std = names.map(k => invRowHtml(k, have.get(k) || '', false));
+  const extra = (e.invs || []).filter(x => !names.includes(String(x.k).toUpperCase())).map(x => invRowHtml(x.k, x.v, true));
+  return [...std, ...extra].join('');
+}
 function rteField(name, ph, tall) { return `<div class="rte ${tall ? 'tall' : ''}" contenteditable="true" data-field="${name}" data-ph="${esc(ph)}"></div>`; }
 function openEditor(id, bed) {
   const existing = id ? S.entries.find(e => e.id === id) : null;
-  const e = existing ? clone(existing) : { id: newId(), bed: bed || '', name: '', age: '', uhid: '', category: 'other', doa: S.date, micuDate: S.date, consultant: '', source: 'ER', referral: '', diagnosis: '', investigations: '', history: '', plan: '', drugs: '', outcome: 'active', outcomeNote: '', carried: false };
+  const e = existing ? clone(existing) : { id: newId(), bed: bed || '', name: '', age: '', uhid: '', category: 'other', doa: S.date, micuDate: S.date, consultant: '', source: 'ER', referral: '', diagnosis: '', investigations: '', history: '', plan: '', antibiotics: '', drugs: '', invs: [], outcome: 'active', outcomeNote: '', carried: false };
+  if (existing && (e.antibiotics === undefined || e.antibiotics === null)) { const sp = splitDrugLines(e.drugs); e.antibiotics = sp.abx; e.drugs = sp.other; }
+  if (!Array.isArray(e.invs)) e.invs = [];
   const all = S.entries;
   const dl = (idn, vals) => `<datalist id="${idn}">${[...new Set(vals.filter(Boolean))].sort().map(v => `<option value="${esc(v)}">`).join('')}</datalist>`;
   const bedOpts = [...new Set([...S.settings.beds, e.bed].filter(Boolean))];
@@ -1034,10 +1095,15 @@ function openEditor(id, bed) {
         <button data-cmd="removeFormat" title="Clear formatting">${icon('x')}</button>
       </div>
       <div class="panel"><h4>Diagnosis</h4>${rteField('diagnosis', 'Tap the tags below or type')}${tagRow('Tap to add', '.rte[data-field="diagnosis"]', S.settings.dxTags, 'dx')}</div>
-      <div class="panel"><h4>Key investigations</h4>${rteField('investigations', 'ECHO: EF …, RESP PANEL: …, USG: …')}</div>
+      <div class="panel"><h4>Key investigations</h4>
+        <div id="invRows">${invRowsHtml(e)}</div>
+        <button type="button" class="btn soft" data-action="inv-add">${icon('plus')} Add another test</button>
+        <div class="inv-free">${rteField('investigations', 'Anything else (free text)')}</div>
+        <p class="help">Write only the result next to the test. Tests left empty are not printed.</p></div>
       <div class="panel"><h4>History</h4>${rteField('history', 'H/O FEVER AND COUGH FOR 7 DAYS…', true)}</div>
       <div class="panel"><h4>Current status, consultants' advice &amp; plan</h4>${rteField('plan', 'GCS 15, ON 2L O2… ENSURE CARDIO REF. DR. X: …', true)}</div>
-      <div class="panel"><h4>Antibiotics / drugs</h4>${rteField('drugs', 'Tap the tags below or type (one per line)')}${tagRow('Antibiotics', '.rte[data-field="drugs"]', S.settings.abxTags, 'line')}${tagRow('Other drugs', '.rte[data-field="drugs"]', S.settings.drugTags, 'line')}</div>
+      <div class="panel"><h4>Antibiotics</h4>${rteField('antibiotics', 'Tap the antibiotic tags below or type (one per line)')}${tagRow('Tap to add', '.rte[data-field="antibiotics"]', S.settings.abxTags, 'line')}</div>
+      <div class="panel"><h4>Other drugs</h4>${rteField('drugs', 'Tap the tags below or type (one per line)')}${tagRow('Tap to add', '.rte[data-field="drugs"]', S.settings.drugTags, 'line')}<p class="help">On the printed sheet the antibiotics come first, then a gap, then the other drugs.</p></div>
       <div class="panel" id="edCpr"><h4>CPR in ICU</h4>${cprBoxHtml()}</div>
       <div class="panel"><h4>Left ICU after this handover?</h4>
         <div class="outcomes" id="outcomes">${OUTCOMES.map(o => `<button type="button" data-action="outcome" data-v="${o.id}" class="${o.id === e.outcome ? 'on' : ''}">${esc(o.label)}</button>`).join('')}</div>
@@ -1051,10 +1117,20 @@ function openEditor(id, bed) {
     </div>`);
   const body = $('#edBody');
   body.dataset.id = e.id; body.dataset.outcome = e.outcome; body.dataset.isnew = existing ? '' : '1';
+  $$('#invRows .inv-v', body).forEach(t => { if (t.value) { t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 240) + 'px'; } });
   body._orig = e;
   RICH_FIELDS.forEach(f => { $(`.rte[data-field="${f}"]`, body).innerHTML = e[f] || ''; });
   body._cpr = clone(e.cpr || []);
-  wireCprBox($('#edCpr'), body._cpr, () => S.date || todayISO());
+  const askDeath = async nv => {
+    if ((body.dataset.outcome || 'active') === 'death') return;
+    if (!(await ask('No ROSC after CPR. Did the patient die?\n\nTap "Mark as Death" to record it now. You can still change it below.', { ok: 'Mark as Death', cancel: 'Not yet' }))) return;
+    body.dataset.outcome = 'death';
+    $$('#outcomes button').forEach(b => b.classList.toggle('on', b.dataset.v === 'death'));
+    $('#outNoteWrap').classList.remove('hidden');
+    const inp = $('[name="outcomeNote"]', body);
+    if (inp && !inp.value.trim()) inp.value = `${nv.time ? nv.time + ', ' : ''}after CPR${nv.minutes ? ' ' + nv.minutes + ' min' : ''}, no ROSC`;
+  };
+  wireCprBox($('#edCpr'), body._cpr, () => S.date || todayISO(), askDeath);
   $('#outNoteWrap').classList.toggle('hidden', e.outcome === 'active');
   setupRTE(body);
   if (existing) fillEditorHistory(e.id);
@@ -1107,12 +1183,14 @@ function rteCmd(cmd, val) {
 function pickChips(target, items, mode, cur) {
   if (!items || !items.length) return mode === 'set' ? `<p class="help pick-empty">Admin can add names in Settings → Lists.</p>` : '';
   const curList = mode === 'multi' ? splitNames(cur) : [String(cur || '').toUpperCase()];
+  if (mode === 'multi' || mode === 'set') items = azSort(items);
   return `<div class="pick wrap" data-target="${esc(target)}" data-mode="${mode}">${items.map(v => `<button type="button" class="pk ${curList.includes(v) ? 'on' : ''}" data-pick="${esc(v)}">${mode === 'multi' ? '<i class="tick"></i>' : ''}${esc(v)}</button>`).join('')}</div>`;
 }
 function splitNames(v) { return String(v || '').split(/\s*[,;\n]\s*/).map(x => x.trim().toUpperCase()).filter(Boolean); }
 function tagRow(label, target, items, mode) {
   if (!items || !items.length) return '';
-  return `<div class="tagrow"><span class="tag-lbl">${esc(label)}</span><div class="pick wrap ${items.length > 8 ? 'clip' : ''}" data-target="${esc(target)}" data-mode="${mode}">${items.map(v => `<button type="button" class="pk tag" data-pick="${esc(v)}">${esc(v)}</button>`).join('')}</div>${items.length > 8 ? `<button type="button" class="pk-more">Show all ${items.length}</button>` : ''}</div>`;
+  items = azSort(items);
+  return `<div class="tagrow"><span class="tag-lbl">${esc(label)}</span>${items.length > 8 ? `<input class="input tag-find" data-pick-filter="tags" placeholder="Type to search A–Z list" autocapitalize="characters">` : ''}<div class="pick wrap ${items.length > 8 ? 'clip' : ''}" data-target="${esc(target)}" data-mode="${mode}">${items.map(v => `<button type="button" class="pk tag" data-pick="${esc(v)}">${esc(v)}</button>`).join('')}</div>${items.length > 8 ? `<button type="button" class="pk-more">Show all ${items.length}</button>` : ''}</div>`;
 }
 function hasWord(text, w) { return new RegExp('(^|[\\s,;/(])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '($|[\\s,;/.)])', 'i').test(text); }
 function addToRich(el, tag, mode) {
@@ -1157,14 +1235,20 @@ document.addEventListener('click', ev => {
 });
 document.addEventListener('input', ev => {
   const t = ev.target;
-  if (t.matches && t.matches('[data-multi]')) { const box = t.parentNode.querySelector('.pick'); if (box) { const list = splitNames(t.value); box.querySelectorAll('.pk').forEach(x => x.classList.toggle('on', list.includes(x.dataset.pick))); } return; }
+  if (t.matches && t.matches('.inv-v')) { t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 240) + 'px'; return; }
+  if (t.matches && t.matches('[data-multi]')) {
+    const box = t.parentNode.querySelector('.pick');
+    if (box) { const list = splitNames(t.value); const q = (t.value.split(/[,;]/).pop() || '').trim().toUpperCase().replace(/^DR\.?\s*/, ''); box.querySelectorAll('.pk').forEach(x => { x.classList.toggle('on', list.includes(x.dataset.pick)); x.classList.toggle('hidden', !!q && !x.dataset.pick.includes(q) && !list.includes(x.dataset.pick)); }); }
+    return;
+  }
   if (!t.matches || !t.matches('[data-pick-filter]')) return;
   const box = t.parentNode.querySelector('.pick'); if (!box) return;
-  const q = t.value.trim().toUpperCase();
-  box.querySelectorAll('.pk').forEach(x => { x.classList.toggle('hidden', !!q && !x.dataset.pick.includes(q.replace(/^DR\.?\s*/, ''))); x.classList.toggle('on', x.dataset.pick === q); });
+  const q = t.value.trim().toUpperCase(), tags = t.dataset.pickFilter === 'tags';
+  box.querySelectorAll('.pk').forEach(x => { x.classList.toggle('hidden', !!q && !x.dataset.pick.includes(q.replace(/^DR\.?\s*/, ''))); if (!tags) x.classList.toggle('on', x.dataset.pick === q); });
+  if (tags) { box.classList.toggle('open', !!q); const more = t.parentNode.querySelector('.pk-more'); if (more) more.classList.toggle('hidden', !!q); }
 });
-function listEd(id, items, ph) { return `<div class="led" id="${id}">${items.map(v => ledRow(v, ph)).join('')}</div><button type="button" class="btn soft" data-action="led-add" data-id="${id}" data-ph="${esc(ph)}">${icon('plus')} Add</button>`; }
-function ledRow(v, ph) { return `<div class="led-row"><input class="input" value="${esc(v)}" placeholder="${esc(ph)}" autocapitalize="characters"><button type="button" class="icon-btn" data-action="led-up" aria-label="Move up">${icon('up')}</button><button type="button" class="icon-btn" data-action="led-del" aria-label="Delete">${icon('trash')}</button></div>`; }
+function listEd(id, items, ph, sorted) { return `<div class="led" id="${id}">${items.map(v => ledRow(v, ph, sorted)).join('')}</div><button type="button" class="btn soft" data-action="led-add" data-id="${id}" data-ph="${esc(ph)}" data-sorted="${sorted ? 1 : ''}">${icon('plus')} Add</button>`; }
+function ledRow(v, ph, sorted) { return `<div class="led-row"><input class="input" value="${esc(v)}" placeholder="${esc(ph)}" autocapitalize="characters">${sorted ? '' : `<button type="button" class="icon-btn" data-action="led-up" aria-label="Move up">${icon('up')}</button>`}<button type="button" class="icon-btn" data-action="led-del" aria-label="Delete">${icon('trash')}</button></div>`; }
 function ledVals(id) { return [...new Set($$('#' + id + ' .led-row input').map(i => i.value.trim().toUpperCase()).filter(Boolean))]; }
 
 /* allow-listed formatting only */
@@ -1202,6 +1286,7 @@ async function saveEntry() {
   ['name', 'consultant', 'source', 'referral'].forEach(k => { e[k] = e[k].toUpperCase(); });
   e.referral = splitNames(e.referral).join(', ');
   RICH_FIELDS.forEach(f => { e[f] = sanitizeHtml($(`.rte[data-field="${f}"]`, body).innerHTML); });
+  e.invs = $$('#invRows .inv-row', body).map(row => ({ k: (row.dataset.custom ? $('.inv-k', row).value : $('.inv-k', row).textContent).trim().toUpperCase(), v: $('.inv-v', row).value.trim() })).filter(x => x.k && x.v);
   e.outcome = body.dataset.outcome || 'active';
   if (e.outcome === 'active') e.outcomeNote = '';
   e.cpr = clone(body._cpr || []);
@@ -1359,10 +1444,10 @@ function buildDocx(docx, data) {
         cell(textParas(docx, bedLines(e.bed), base), 0),
         cell(c2, 1),
         cell(c3, 2),
-        cell(join(rich(e.diagnosis), rich(e.investigations)), 3),
+        cell(join(rich(e.diagnosis), rich(invHtml(e))), 3),
         cell(textParas(docx, src.length <= 3 ? src.split('') : [src], base, { align: AlignmentType.CENTER }), 4),
         cell(join(rich(e.history), rich(e.plan)), 5),
-        cell(rich(e.drugs), 6),
+        cell((() => { const dp = drugParts(e), a = rich(dp.abx), o = rich(dp.other); return a.length && o.length ? [...a, new Paragraph({ spacing: { before: 0, after: 0, line: 420 }, children: [] }), ...o] : [...a, ...o]; })(), 6),
         cell(textParas(docx, splitNames(e.referral).length ? splitNames(e.referral) : [''], base), 7)
       ]
     });
@@ -1415,9 +1500,9 @@ function doPrint() {
     return `<tr><td>${lines(b.length === 4 ? [b.slice(0, 2), b.slice(2)] : [b])}</td>
     <td>${lines([[e.name, ageTxt(e.age)].filter(Boolean).join(', ')])}${e.uhid ? lines(['', 'UHID: ' + e.uhid]) : ''}${out ? `<div>&nbsp;</div><div><b>${esc(out.toUpperCase())}${e.outcomeNote ? ' (' + esc(e.outcomeNote) + ')' : ''}</b></div>` : ''}</td>
     <td>${lines(['DOA:' + fmtShort(e.doa), 'MICU:' + fmtShort(e.micuDate), '', e.consultant || ''])}</td>
-    <td>${join(e.diagnosis, e.investigations)}</td>
+    <td>${join(e.diagnosis, invHtml(e))}</td>
     <td style="text-align:center">${lines(src.length <= 3 ? src.split('') : [src])}</td>
-    <td>${join(e.history, e.plan)}</td><td>${e.drugs || ''}</td><td>${lines(splitNames(e.referral).length ? splitNames(e.referral) : [''])}</td></tr>`;
+    <td>${join(e.history, e.plan)}</td><td>${drugsHtml(e)}</td><td>${lines(splitNames(e.referral).length ? splitNames(e.referral) : [''])}</td></tr>`;
   }).join('')}</tbody></table>${interimForPrint(S.entries).length ? `<div class="ps-interim"><b>CAME AND LEFT BEFORE THE NEXT HANDOVER</b>${interimForPrint(S.entries).map(e => `<div>${esc(interimLine(e))}</div>`).join('')}</div>` : ''}`;
   closeModal();
   setTimeout(() => window.print(), 150);
@@ -1428,7 +1513,7 @@ let setTab = 'look';
 function openSettings(tab) {
   if (tab) setTab = tab;
   const p = S.prefs, admin = isAdmin();
-  const tabs = [['look', 'Look'], ['print', 'Print'], ...(admin ? [['lists', 'Lists'], ['users', 'Users'], ['drive', 'Drive']] : []), ['account', 'Account']];
+  const tabs = [['look', 'Look'], ['print', 'Print'], ...(isStaffAdmin() ? [['lists', 'Lists'], ['users', 'Users'], ['staff', 'Staff list']] : []), ...(admin ? [['drive', 'Drive']] : []), ['account', 'Account']];
   if (!tabs.find(t => t[0] === setTab)) setTab = 'look';
   let body = '';
   if (setTab === 'look') body = `
@@ -1443,22 +1528,24 @@ function openSettings(tab) {
     <div class="panel"><h4>Came and left before the next handover</h4><div class="opt-row"><button class="opt ${!p.printInterim ? 'on' : ''}" data-action="pref" data-k="printInterim" data-v="0">Only in the app</button><button class="opt ${p.printInterim ? 'on' : ''}" data-action="pref" data-k="printInterim" data-v="1">Also as a short list under the table</button></div></div>
     <div class="panel"><h4>Patients who left ICU after the handover</h4><div class="opt-row"><button class="opt ${!p.includeLeft ? 'on' : ''}" data-action="pref" data-k="includeLeft" data-v="0">Leave them out</button><button class="opt ${p.includeLeft ? 'on' : ''}" data-action="pref" data-k="includeLeft" data-v="1">Print them with their status</button></div></div>`;
   if (setTab === 'lists') {
-    const sec = (id, title, items, ph, help, open) => `<details class="panel" ${open ? 'open' : ''}><summary><b>${title}</b> · ${items.length}</summary>${help ? `<p class="help" style="margin:0 0 10px">${help}</p>` : ''}${listEd(id, items, ph)}</details>`;
+    const sec = (id, title, items, ph, help, open, sorted) => `<details class="panel" ${open ? 'open' : ''}><summary><b>${title}</b> · ${items.length}</summary>${help ? `<p class="help" style="margin:0 0 10px">${help}</p>` : ''}${listEd(id, sorted ? azSort(items) : items, ph, sorted)}</details>`;
     body = `<p class="help" style="margin-top:0">These lists appear as quick buttons for everyone. Add, change, delete or move items up, then tap Save.</p>
     ${sec('ledBeds', 'Beds', S.settings.beds, 'Bed number, e.g. 2218', 'Shown in this order on the dashboard and the printed sheet.', true)}
-    ${sec('ledCons', 'Consultants', S.settings.consultants, 'e.g. DR. ZAMAN', 'Used for both the Consultant and the Referral doctor boxes.')}
+    ${sec('ledCons', 'Consultants', S.settings.consultants, 'e.g. DR. ZAMAN', 'Used for both the Consultant and the Referral doctor boxes. Always shown A–Z.', false, true)}
     ${sec('ledSrc', '"From" options', S.settings.sources, 'e.g. WARD/CABIN', 'After tapping one, the doctor can still add where exactly (e.g. WARD/CABIN — MEDICINE UNIT 3).')}
-    ${sec('ledDx', 'Diagnosis tags', S.settings.dxTags, 'e.g. SEPTIC SHOCK')}
-    ${sec('ledAbx', 'Antibiotic tags', S.settings.abxTags, 'e.g. MERO')}
-    ${sec('ledDrug', 'Other drug tags', S.settings.drugTags, 'e.g. CLEXANE')}
+    ${sec('ledDx', 'Diagnosis tags', S.settings.dxTags, 'e.g. SEPTIC SHOCK', 'Always shown A–Z.', false, true)}
+    ${sec('ledAbx', 'Antibiotic tags', S.settings.abxTags, 'e.g. MERO', 'Always shown A–Z. These names also help the app tell antibiotics from other drugs in old sheets.', false, true)}
+    ${sec('ledDrug', 'Other drug tags', S.settings.drugTags, 'e.g. CLEXANE', 'Always shown A–Z.', false, true)}
+    ${sec('ledInv', 'Investigation rows', S.settings.invNames || DEFAULT_INV_NAMES, 'e.g. ECHO', 'These rows appear in every patient\'s Key investigations box. The doctor writes only the result on the right. A row left empty is not printed. Move them up or down as you like.')}
     <button class="btn primary block" data-action="save-lists">Save for everyone</button>`;
   }
   if (setTab === 'drive') body = driveTab();
+  if (setTab === 'staff') body = staffTab();
   if (setTab === 'users') body = `<div class="panel" id="usersPanel"><div class="loading" style="min-height:120px"><div class="spinner"></div></div></div>`;
   if (setTab === 'account') body = `
-    <div class="panel"><h4>Signed in</h4><b>${esc(S.profile.name || '')}</b><div class="help">${esc(S.profile.email || '')} · ${esc(S.profile.role === 'admin' ? 'Admin' : 'Medical officer')}</div></div>
+    <div class="panel"><h4>Signed in</h4><b>${esc(S.profile.name || '')}</b><div class="help">${esc(S.profile.email || '')}${S.profile.hid ? ' · ID ' + esc(S.profile.hid) : ''} · ${esc(roleLabel(S.profile.role))}</div></div>
     <div class="panel"><h4>My devices (${(S.profile.devices || []).length}${limitApplies(S.profile) ? ' of ' + maxDevices() : ''})</h4>${deviceRows(S.profile.devices)}${limitApplies(S.profile) ? `<p class="help">Your account works on up to ${maxDevices()} devices. Remove one to use another phone or computer.</p>` : '<p class="help">Admin accounts have no device limit.</p>'}</div>
-    ${lockPanel()}
+    ${stationPanel()}${lockPanel()}
     <div class="panel"><h4>Data</h4><div class="help">${DEMO ? 'Demo mode — data is kept on this device only.' : 'Cloud mode — saved to Firebase and shared with your team. Works offline and syncs later.'}</div><div class="help">Version ${APP_VERSION}</div></div>
     ${DEMO ? `<button class="btn danger block" data-action="demo-reset">Reset demo data</button>` : `<button class="btn block" data-action="sign-out">${icon('out')} Sign out</button>`}`;
   openModal(`<div class="modal-head"><h3>Settings</h3><button class="icon-btn" data-action="close" aria-label="Close">${icon('x')}</button></div>
@@ -1468,22 +1555,79 @@ function openSettings(tab) {
   if (setTab === 'users') loadUsers();
 }
 function catRow(c) { return `<div class="cat-row" data-id="${esc(c.id)}"><input type="color" value="${esc(c.color)}"><input class="input" value="${esc(c.name)}"><button class="icon-btn" data-action="cat-del" aria-label="Remove">${icon('trash')}</button></div>`; }
+const staffByEmail = email => (S.staff || []).find(s => s.email && s.email === String(email || '').toLowerCase());
+const linkPatch = u => { const s = u && staffByEmail(u.email); return s ? { name: s.name, hid: s.hid || '', staffId: s.id } : {}; };
+// copy name / Hospital ID from the staff list onto matching accounts (and block people marked as left)
+async function syncStaffUsers(list, doBlock) {
+  const users = await S.store.listUsers(); let linked = 0, blocked = 0, failed = 0;
+  for (const u of users) {
+    if (u.uid === S.user.uid) continue;
+    if (!isAdmin() && u.role !== 'mo') continue;
+    const s = (list || []).find(x => x.email && x.email === String(u.email || '').toLowerCase()); if (!s) continue;
+    const patch = {};
+    if (s.name && u.name !== s.name) patch.name = s.name;
+    if ((u.hid || '') !== (s.hid || '')) patch.hid = s.hid || '';
+    if (u.staffId !== s.id) patch.staffId = s.id;
+    if (doBlock && s.active === false && u.status === 'approved' && (u.role === 'mo' || (isAdmin() && u.role === 'sub'))) patch.status = 'blocked';
+    if (!Object.keys(patch).length) continue;
+    try { await S.store.setUser(u.uid, patch); if (patch.status) blocked++; else linked++; } catch (e) { console.warn('sync', e); failed++; }
+  }
+  return { linked, blocked, failed };
+}
 async function loadUsers() {
   const panel = $('#usersPanel');
   try {
-    const users = (await S.store.listUsers()).sort((a, b) => ({ pending: 0, approved: 1, blocked: 2 }[a.status] ?? 3) - ({ pending: 0, approved: 1, blocked: 2 }[b.status] ?? 3) || naturalCmp(a.name, b.name));
+    let users = await S.store.listUsers();
+    if ((S.staff || []).length && !S.syncedOnce) {
+      S.syncedOnce = true;
+      const r = await syncStaffUsers(S.staff, false).catch(() => null);
+      if (r && r.linked) users = await S.store.listUsers();
+    }
+    users.sort((a, b) => ({ pending: 0, approved: 1, blocked: 2 }[a.status] ?? 3) - ({ pending: 0, approved: 1, blocked: 2 }[b.status] ?? 3) || naturalCmp(a.name, b.name));
+    S.usersCache = users;
     if (!panel.isConnected) return;
-    panel.innerHTML = `<h4>Team (${users.length})</h4>` + users.map(u => {
-      const me = u.uid === S.user.uid;
-      return `<div class="user-row"><div class="u"><b>${esc(u.name || '—')}</b><small>${esc(u.email)}</small></div>
-        <span class="st ${esc(u.status)}">${esc(u.status)}</span>${u.role === 'admin' ? '<span class="st approved">admin</span>' : ''}<span class="chip">${(u.devices || []).length} device${(u.devices || []).length === 1 ? '' : 's'}</span>
-        ${!me && (u.devices || []).length ? `<button class="btn" data-action="dev-reset" data-uid="${esc(u.uid)}">Clear devices</button>` : ''}
-        ${!me && u.status === 'approved' && u.role !== 'admin' ? `<label class="study-acc">Study <select class="input" data-study-uid="${esc(u.uid)}">${[['', 'No access'], ['view', 'Can view'], ['edit', 'Can edit']].map(([v, l]) => `<option value="${v}" ${(u.study || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>` : ''}
-        ${me ? '' : `${u.status !== 'approved' ? `<button class="btn primary" data-action="user" data-uid="${esc(u.uid)}" data-v="approve">Approve</button>` : ''}
-        ${u.status !== 'blocked' ? `<button class="btn danger" data-action="user" data-uid="${esc(u.uid)}" data-v="block">Block</button>` : ''}
-        ${u.status === 'approved' ? `<button class="btn" data-action="user" data-uid="${esc(u.uid)}" data-v="${u.role === 'admin' ? 'unadmin' : 'admin'}">${u.role === 'admin' ? 'Remove admin' : 'Make admin'}</button>` : ''}`}</div>`;
+    const hasStaff = (S.staff || []).length > 0, adminView = isAdmin();
+    panel.innerHTML = `<h4>Users (${users.length})</h4>` + users.map(u => {
+      const me = u.uid === S.user.uid, canAct = !me && (adminView || u.role === 'mo'), st = staffByEmail(u.email);
+      const roleChip = u.role === 'admin' ? '<span class="st approved">admin</span>' : u.role === 'sub' ? '<span class="st approved">sub-admin</span>' : '';
+      const roleBtns = !adminView || me || u.status !== 'approved' ? '' : u.role === 'admin' ? `<button class="btn" data-action="user" data-uid="${esc(u.uid)}" data-v="unadmin">Remove admin</button>`
+        : u.role === 'sub' ? `<button class="btn" data-action="user" data-uid="${esc(u.uid)}" data-v="unsub">Remove sub-admin</button>`
+        : `<button class="btn" data-action="user" data-uid="${esc(u.uid)}" data-v="sub">Make sub-admin</button><button class="btn" data-action="user" data-uid="${esc(u.uid)}" data-v="admin">Make admin</button>`;
+      return `<div class="user-row"><div class="u"><b>${esc(u.name || '—')}</b>${u.hid ? ` <small>ID ${esc(u.hid)}</small>` : ''}<small>${esc(u.email)}</small></div>
+        <span class="st ${esc(u.status)}">${esc(u.status)}</span>${roleChip}${hasStaff && !st && u.role === 'mo' ? '<span class="st blocked">not in staff list</span>' : ''}${st && st.active === false ? '<span class="st blocked">left</span>' : ''}<span class="chip">${(u.devices || []).length} device${(u.devices || []).length === 1 ? '' : 's'}</span>
+        ${canAct && (u.devices || []).length ? `<button class="btn" data-action="dev-reset" data-uid="${esc(u.uid)}">Clear devices</button>` : ''}
+        ${adminView && !me && u.status === 'approved' && u.role === 'mo' ? `<label class="study-acc">Study <select class="input" data-study-uid="${esc(u.uid)}">${[['', 'No access'], ['view', 'Can view'], ['edit', 'Can edit']].map(([v, l]) => `<option value="${v}" ${(u.study || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>` : ''}
+        ${canAct ? `${u.status !== 'approved' ? `<button class="btn primary" data-action="user" data-uid="${esc(u.uid)}" data-v="approve">Approve</button>` : ''}
+        ${u.status !== 'blocked' ? `<button class="btn danger" data-action="user" data-uid="${esc(u.uid)}" data-v="block">Block</button>` : ''}${roleBtns}` : ''}</div>`;
     }).join('');
   } catch (e) { panel.innerHTML = `<p class="err">Could not load users: ${esc(e.code || e.message)}</p>`; }
+}
+
+/* ---------------- staff list (names, Hospital IDs, emails) ---------------- */
+const STAFF_POSTS = [['mo', 'Medical officer'], ['spec', 'Specialist']];
+const newStaffId = () => 's' + newId().slice(0, 8);
+function staffRowHtml(s) {
+  return `<div class="staff-row" data-id="${esc(s.id)}"><div class="row">
+    <label class="field"><span>Name</span><input class="input st-name" value="${esc(s.name || '')}" placeholder="e.g. DR. RIAD"></label>
+    <label class="field"><span>Hospital ID</span><input class="input st-hid" value="${esc(s.hid || '')}" inputmode="numeric"></label>
+    <label class="field" style="grid-column:1/-1"><span>Email they sign in with (optional, but it lets the app recognise them)</span><input class="input st-email" type="email" value="${esc(s.email || '')}" autocapitalize="none"></label>
+    <label class="field"><span>Post</span><select class="input st-post">${STAFF_POSTS.map(([v, l]) => `<option value="${v}" ${(s.post || 'mo') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+    <label class="field"><span>Status</span><select class="input st-active"><option value="1" ${s.active === false ? '' : 'selected'}>Working here</option><option value="0" ${s.active === false ? 'selected' : ''}>Left</option></select></label>
+  </div><button type="button" class="btn danger" data-action="staff-del">${icon('trash')} Remove row</button></div>`;
+}
+function staffTab() {
+  const list = (S.staff || []).slice().sort((a, b) => naturalCmp(a.name || '', b.name || ''));
+  return `<div class="panel" id="staffPanel"><h4>Staff list · ${list.length}</h4>
+    <p class="help" style="margin-top:0">Write each doctor once. When someone signs up with the email written here, the app fills in their name and Hospital ID and you can approve with one tap. The log shows their name and ID next to every change. When a doctor leaves, set <b>Left</b>; their account is blocked and the data on their phone is cleared. Their name stays in old logs.</p>
+    <div id="staffRows">${list.map(staffRowHtml).join('')}</div>
+    <button type="button" class="btn soft" data-action="staff-add">${icon('plus')} Add a person</button>
+    <button type="button" class="btn primary block" data-action="staff-save" style="margin-top:12px">Save staff list</button></div>`;
+}
+function readStaffRows() {
+  return $$('#staffRows .staff-row').map(r => ({
+    id: r.dataset.id, name: $('.st-name', r).value.trim(), hid: $('.st-hid', r).value.trim(), email: $('.st-email', r).value.trim().toLowerCase(),
+    post: $('.st-post', r).value, active: $('.st-active', r).value !== '0'
+  })).filter(s => s.name || s.hid || s.email);
 }
 
 /* =================================================================
@@ -1550,21 +1694,53 @@ const A = {
     if (k === 'cardSize') { $$('[data-action="size"]').forEach(b => b.classList.toggle('on', b.dataset.v === v)); renderGrid(); }
     const sc = $('.modal-body') ? $('.modal-body').scrollTop : 0; openSettings(); if ($('.modal-body')) $('.modal-body').scrollTop = sc;
   },
-  'led-add': t => { const box = $('#' + t.dataset.id); box.insertAdjacentHTML('beforeend', ledRow('', t.dataset.ph || '')); const ins = $$('input', box); ins[ins.length - 1].focus(); },
+  'station-toggle': async () => {
+    if (!isStaffAdmin()) return;
+    if (isStation()) { lsDel(STATION_KEY); toast('This computer is a normal device again'); setTimeout(() => location.reload(), 600); return; }
+    if (!(await ask('Use this computer as a shared station?\n\nDoctors sign in with their own email and password. It does not count as one of their devices, there is no PIN, and it signs out by itself after 15 minutes of no use.', { ok: 'Yes, shared station' }))) return;
+    lsSet(STATION_KEY, '1'); lsDel(REG_KEY);
+    try { const p = S.profile, me = myDeviceId(); if ((p.devices || []).some(d => d.id === me)) { p.devices = p.devices.filter(d => d.id !== me); await S.store.setUser(p.uid, { devices: p.devices }); } } catch (e) { console.warn(e); }
+    toast('Shared station is on'); setTimeout(() => location.reload(), 600);
+  },
+  'staff-add': () => { const box = $('#staffRows'); if (!box) return; box.insertAdjacentHTML('beforeend', staffRowHtml({ id: newStaffId(), post: 'mo', active: true })); const rows = $$('.staff-row', box); const last = rows[rows.length - 1]; last.scrollIntoView({ block: 'center' }); $('.st-name', last).focus(); },
+  'staff-del': async t => { if (await ask('Remove this row? Use "Left" instead if the doctor only left the unit, so old logs keep the name.', { ok: 'Remove row', danger: true })) t.closest('.staff-row').remove(); },
+  'staff-save': async () => {
+    const list = readStaffRows();
+    for (const s of list) if (!s.name) { toast('Every row needs a name'); return; }
+    const dup = (k, label) => { const seen = new Set(); for (const s of list) { const v = s[k]; if (!v) continue; if (seen.has(v)) { toast(`${label} ${v} is written twice`); return true; } seen.add(v); } return false; };
+    if (dup('hid', 'Hospital ID') || dup('email', 'Email')) return;
+    try {
+      const users = await S.store.listUsers();
+      const toBlock = users.filter(u => u.status === 'approved' && (u.role === 'mo' || (isAdmin() && u.role === 'sub')) && u.uid !== S.user.uid).filter(u => { const s = list.find(x => x.email && x.email === String(u.email || '').toLowerCase()); return s && s.active === false; });
+      let doBlock = false;
+      if (toBlock.length) doBlock = await ask(`Marked as Left: ${toBlock.map(u => u.name || u.email).join(', ')}.\n\nBlock their accounts now? Their phones will be cleared.`, { ok: 'Block them', cancel: 'Not now', danger: true });
+      await settle(S.store.saveStaff(list));
+      S.staff = list;
+      const r = await syncStaffUsers(list, doBlock);
+      toast(`Saved · ${list.length} people${r.linked ? ' · ' + r.linked + ' linked' : ''}${r.blocked ? ' · ' + r.blocked + ' blocked' : ''}${r.failed ? ' · ' + r.failed + ' could not be updated' : ''}`, 4000);
+    } catch (e) { saveFail(e); }
+  },
+  'led-add': t => { const box = $('#' + t.dataset.id); box.insertAdjacentHTML('beforeend', ledRow('', t.dataset.ph || '', t.dataset.sorted === '1')); const ins = $$('input', box); ins[ins.length - 1].focus(); },
+  'inv-add': () => { const box = $('#invRows'); if (!box) return; box.insertAdjacentHTML('beforeend', invRowHtml('', '', true)); const ks = $$('.inv-k', box); ks[ks.length - 1].focus(); },
+  'inv-del': t => t.closest('.inv-row').remove(),
   'led-del': t => t.closest('.led-row').remove(),
   'led-up': t => { const r = t.closest('.led-row'), p = r.previousElementSibling; if (p) r.parentNode.insertBefore(r, p); },
   'cat-add': () => { $('#catList').insertAdjacentHTML('beforeend', catRow({ id: 'c' + Date.now().toString(36), name: '', color: '#0ea5e9' })); $('#catList .cat-row:last-child .input').focus(); },
   'cat-del': t => { const r = t.closest('.cat-row'); if ($$('#catList .cat-row').length <= 1) { toast('Keep at least one category'); return; } r.remove(); },
   'save-lists': async () => {
-    const beds = ledVals('ledBeds'), sources = ledVals('ledSrc'), consultants = ledVals('ledCons'), dxTags = ledVals('ledDx'), abxTags = ledVals('ledAbx'), drugTags = ledVals('ledDrug');
+    const beds = ledVals('ledBeds'), sources = ledVals('ledSrc'), consultants = azSort(ledVals('ledCons')), dxTags = azSort(ledVals('ledDx')), abxTags = azSort(ledVals('ledAbx')), drugTags = azSort(ledVals('ledDrug')), invNames = ledVals('ledInv');
 
     if (!beds.length) { toast('Add at least one bed'); return; }
-    try { const r = await settle(S.store.saveSettings({ beds, sources, consultants, dxTags, abxTags, drugTags })); toast(r === 'pending' ? savedMsg(r) : 'Saved for everyone'); } catch (e) { saveFail(e); }
+    try { const r = await settle(S.store.saveSettings({ beds, sources, consultants, dxTags, abxTags, drugTags, invNames })); toast(r === 'pending' ? savedMsg(r) : 'Saved for everyone'); [['ledCons', consultants], ['ledDx', dxTags], ['ledAbx', abxTags], ['ledDrug', drugTags]].forEach(([id, vals]) => { const box = $('#' + id); if (box) box.innerHTML = vals.map(v => ledRow(v, '', true)).join(''); }); } catch (e) { saveFail(e); }
   },
   user: async t => {
     const v = t.dataset.v, uid = t.dataset.uid;
-    const patch = v === 'approve' ? { status: 'approved' } : v === 'block' ? { status: 'blocked' } : v === 'admin' ? { role: 'admin' } : { role: 'mo' };
+    const u = (S.usersCache || []).find(x => x.uid === uid), st = u && staffByEmail(u.email);
+    const patch = v === 'approve' ? { status: 'approved', ...linkPatch(u) } : v === 'block' ? { status: 'blocked' } : v === 'admin' ? { role: 'admin' } : v === 'sub' ? { role: 'sub' } : { role: 'mo' };
     if (v === 'block' && !(await ask('Stop this person\'s access?', { ok: 'Block', danger: true }))) return;
+    if (v === 'approve' && st && st.active === false && !(await ask(`${st.name} is marked as Left in the staff list. Approve anyway?`, { ok: 'Approve anyway' }))) return;
+    if (v === 'approve' && !st && (S.staff || []).length && !(await ask(`${u ? u.email : 'This email'} is not in the staff list. Approve anyway?`, { ok: 'Approve anyway' }))) return;
+    if ((v === 'admin' || v === 'sub') && !(await ask(`${v === 'admin' ? 'Make this person a full admin? They can delete data, see Drive settings and manage everyone.' : 'Make this person a sub-admin? They can approve doctors, change the lists and the staff list. They cannot delete data or change admins.'}`, { ok: 'Yes, make ' + (v === 'admin' ? 'admin' : 'sub-admin') }))) return;
     try { await S.store.setUser(uid, patch); toast('Updated'); loadUsers(); } catch (e) { saveFail(e); }
   },
   'demo-reset': async () => { if (!(await ask('Reset the demo data on this device?', { ok: 'Reset', danger: true }))) return; try { localStorage.removeItem('handover-demo-v6'); } catch { } location.reload(); },
@@ -1625,15 +1801,15 @@ function ask(msg, { ok = 'OK', cancel = 'Cancel', danger = false, title = '' } =
 /* =================================================================
    CHANGE HISTORY
    ================================================================= */
-const FIELD_LABELS = { bed: 'Bed', name: 'Name', age: 'Age', uhid: 'UHID', doa: 'DOA', micuDate: 'MICU date', consultant: 'Consultant', source: 'From', referral: 'Referral', cpr: 'CPR', diagnosis: 'Diagnosis', investigations: 'Investigations', history: 'History', plan: 'Status & plan', drugs: 'Drugs', outcome: 'Status', outcomeNote: 'Status note' };
+const FIELD_LABELS = { bed: 'Bed', name: 'Name', age: 'Age', uhid: 'UHID', doa: 'DOA', micuDate: 'MICU date', consultant: 'Consultant', source: 'From', referral: 'Referral', cpr: 'CPR', diagnosis: 'Diagnosis', investigations: 'Other investigations', invs: 'Investigations', history: 'History', plan: 'Status & plan', antibiotics: 'Antibiotics', drugs: 'Other drugs', outcome: 'Status', outcomeNote: 'Status note' };
 function fieldVal(v) { if (Array.isArray(v)) return v.length ? JSON.stringify(v.map(x => { const c = { ...x }; delete c.at; return c; })) : ''; return String(v ?? ''); }
 function changedFields(a, b) { return Object.keys(FIELD_LABELS).filter(k => fieldVal((a || {})[k]) !== fieldVal((b || {})[k])); }
 function logRec(action, e, fields, note) {
-  return { at: Date.now(), by: S.profile.name || S.user.email, uid: S.user.uid, action, entryId: e ? e.id : '', name: e ? e.name || '' : '', bed: e ? e.bed || '' : '', fields: fields || [], note: note || '' };
+  return { at: Date.now(), by: S.profile.name || S.user.email, hid: S.profile.hid || '', uid: S.user.uid, action, entryId: e ? e.id : '', name: e ? e.name || '' : '', bed: e ? e.bed || '' : '', fields: fields || [], note: note || '' };
 }
 const ACTION_TEXT = { add: 'added', edit: 'edited', delete: 'deleted', create: 'created the sheet', import: 'imported', archive: 'saved to Drive' };
 function logLine(l) {
-  const who = `<b>${esc(l.by || '')}</b>`;
+  const who = `<b>${esc(l.by || '')}</b>${l.hid ? ` <span class="help">(ID ${esc(l.hid)})</span>` : ''}`;
   const what = l.entryId ? `${esc(ACTION_TEXT[l.action] || l.action)} <b>${esc(l.bed)} ${esc(l.name)}</b>` : esc(ACTION_TEXT[l.action] || l.action);
   const f = l.fields && l.fields.length ? `<div class="help">${l.fields.map(k => esc(FIELD_LABELS[k] || k)).join(', ')}</div>` : '';
   return `<div class="log-row"><span class="log-time">${esc(fmtTime(l.at))}</span><div>${who} ${what}${l.note ? ` <span class="help">· ${esc(l.note)}</span>` : ''}${f}</div></div>`;
@@ -1644,7 +1820,11 @@ async function openActivity() {
   try {
     const logs = await S.store.getLog(S.sid);
     const el = $('#actList'); if (!el) return;
-    el.innerHTML = logs.length ? logs.map(logLine).join('') : '<p class="help">No changes recorded for this day yet.</p>';
+    const people = [...new Set(logs.map(l => l.by).filter(Boolean))].sort();
+    const draw = who => { const list = who ? logs.filter(l => l.by === who) : logs; $('#actRows').innerHTML = list.length ? list.map(logLine).join('') : '<p class="help">No changes recorded for this day yet.</p>'; };
+    el.innerHTML = `${people.length > 1 ? `<label class="field"><span>Show changes by</span><select class="input" id="actWho"><option value="">Everyone (${logs.length})</option>${people.map(p => `<option value="${esc(p)}">${esc(p)} (${logs.filter(l => l.by === p).length})</option>`).join('')}</select></label>` : ''}<div id="actRows"></div>`;
+    draw('');
+    const sel = $('#actWho'); if (sel) sel.onchange = () => draw(sel.value);
   } catch (e) { const el = $('#actList'); if (el) el.innerHTML = `<p class="err">${esc(e.code || e.message)}</p>`; }
 }
 async function fillEditorHistory(id) {
@@ -1812,7 +1992,7 @@ function parseHandoverRow(cells) {
   return {
     bed, name, age, uhid, outcome, outcomeNote, doa, micuDate: micu || doa, consultant: cons.join(' ').toUpperCase(),
     diagnosis: linesHtml(dx), investigations: linesHtml(inv), source: T(4).join('').toUpperCase(),
-    history: linesHtml(hx), plan: (nameNote ? esc(nameNote) + (plan.length ? '<br>' : '') : '') + linesHtml(plan), drugs: linesHtml(L[6] || []), referral: has8 ? T(7).join(', ').toUpperCase() : ''
+    history: linesHtml(hx), plan: (nameNote ? esc(nameNote) + (plan.length ? '<br>' : '') : '') + linesHtml(plan), ...(() => { const sp = splitDrugLines(linesHtml(L[6] || [])); return { antibiotics: sp.abx, drugs: sp.other }; })(), referral: has8 ? T(7).join(', ').toUpperCase() : ''
   };
 }
 /* ---------- old Word 97-2003 .doc files (binary) ---------- */
@@ -2213,7 +2393,7 @@ function rowOf(sid, e) {
   const date = sidDate(sid);
   const day = validISO(e.micuDate) ? diffDays(e.micuDate, date) + 1 : '';
   return [date, fmtClock(sidHM(sid)), e.interim ? 'Came and left' : 'On handover', e.bed, e.name, e.age, e.uhid || '', e.doa || '', e.micuDate || '', day, e.consultant || '', e.source || '', e.referral || '',
-    htmlToText(e.diagnosis), htmlToText(e.investigations), htmlToText(e.history), htmlToText(e.plan), htmlToText(e.drugs),
+    htmlToText(e.diagnosis), invText(e), htmlToText(e.history), htmlToText(e.plan), drugsText(e),
     (OUTCOMES.find(o => o.id === e.outcome) || {}).label || e.outcome, (e.interim ? `Came ${fmtDT(e.inAt)}, left ${fmtDT(e.outAt)}. ` : '') + (e.outcomeNote || ''), pendingTasks(e).join('; '), e.updatedBy || '', e.updatedAt ? new Date(e.updatedAt).toISOString() : '', e.id].map(safeCell);
 }
 // older versions kept the Drive key in the shared settings; move it to the admin-only document
@@ -2321,7 +2501,7 @@ async function runSearch() {
   if (!words.length) { out.innerHTML = `<p class="help">${SR.range.length} handovers loaded. Type a word to search in everything written on them.</p>`; return; }
   const hits = [];
   SR.range.slice().reverse().forEach(day => day.entries.forEach(e => {
-    const text = [e.bed, e.name, e.age, e.uhid, e.consultant, e.referral, ...RICH_FIELDS.map(f => htmlToText(e[f]))].join(' · ');
+    const text = [e.bed, e.name, e.age, e.uhid, e.consultant, e.referral, ...RICH_FIELDS.map(f => htmlToText(e[f])), invText(e)].join(' · ');
     const low = text.toLowerCase(); if (words.every(w => low.includes(w))) hits.push({ sid: day.sid, date: day.date, e, text });
   }));
   out.innerHTML = `<p class="help" style="margin-bottom:8px">${hits.length} match${hits.length === 1 ? '' : 'es'} in ${SR.range.length} handovers</p>` + hits.slice(0, 120).map(h => `
@@ -2499,7 +2679,7 @@ async function turnBioOn() {
 }
 function lockNow() { if (!lockOn() || !lockCfg() || !S.user) return; LOCK.unlocked = false; if (!document.querySelector('#lock-root .lock-screen')) pinPad('unlock'); }
 function ensureLock() {
-  if (!lockOn() || !S.user) return;
+  if (!lockOn() || !S.user || isStation()) return;
   if (!LOCK.wired) {
     LOCK.wired = true;
     ['pointerdown', 'keydown', 'touchstart', 'wheel'].forEach(ev => document.addEventListener(ev, () => { LOCK.last = Date.now(); }, { passive: true, capture: true }));
@@ -2515,7 +2695,7 @@ function ensureLock() {
   if (!LOCK.unlocked) pinPad('unlock');
 }
 function lockPanel() {
-  if (!lockOn()) return '';
+  if (!lockOn() || isStation()) return '';
   const c = lockCfg(); if (!c) return '';
   const opts = [['0', 'As soon as I leave the app'], ['1', 'After 1 minute'], ['5', 'After 5 minutes'], ['15', 'After 15 minutes']];
   return `<div class="panel"><h4>App lock (this device)</h4>
@@ -2563,7 +2743,33 @@ async function wipeLeftovers() {
     await Promise.all([...names].map(n => new Promise(res => { const q = indexedDB.deleteDatabase(n); q.onsuccess = q.onerror = q.onblocked = () => res(); })));
   } catch (e) { console.warn('leftovers', e); }
 }
-const WIPE_MSG = { removed: 'This device was removed from your account, so its data was cleared. Sign in again if you still use it.', blocked: 'Your account was blocked by the admin. Data on this device was cleared.', pin: 'Too many wrong PINs. Data on this device was cleared. Sign in again with your email and password.', forgot: 'Signed out and cleared. Sign in again, then choose a new PIN.', signout: 'Signed out. Data on this device was cleared.' };
+const WIPE_MSG = { removed: 'This device was removed from your account, so its data was cleared. Sign in again if you still use it.', blocked: 'Your account was blocked by the admin. Data on this device was cleared.', pin: 'Too many wrong PINs. Data on this device was cleared. Sign in again with your email and password.', forgot: 'Signed out and cleared. Sign in again, then choose a new PIN.', signout: 'Signed out. Data on this device was cleared.', station: 'Signed out after 15 minutes of no use. Data on this computer was cleared.' };
+
+/* =================================================================
+   SHARED STATION (the ICU computer many doctors use)
+   ================================================================= */
+const STATION_KEY = 'handover-station', STATION_IDLE_MS = 15 * 60e3;
+const isStation = () => lsGet(STATION_KEY) === '1';
+const STN = { on: false, last: Date.now(), warned: false };
+function startStationTimer() {
+  if (!isStation() || STN.on) return;
+  STN.on = true; STN.last = Date.now();
+  ['pointerdown', 'keydown', 'touchstart', 'wheel'].forEach(ev => document.addEventListener(ev, () => { STN.last = Date.now(); STN.warned = false; }, { passive: true, capture: true }));
+  setInterval(() => {
+    if (!S.user || !isStation()) return;
+    const idle = Date.now() - STN.last;
+    if (idle > STATION_IDLE_MS) { wipeDevice('station'); return; }
+    if (idle > STATION_IDLE_MS - 60e3 && !STN.warned) { STN.warned = true; toast('Signing out in 1 minute. Touch the screen to stay signed in.', 6000); }
+  }, 10000);
+}
+function stationPanel() {
+  if (!isStaffAdmin()) return '';
+  const on = isStation();
+  return `<div class="panel"><h4>Shared computer</h4><p class="help" style="margin-top:0">${on
+    ? 'This computer is a <b>shared station</b>. Doctors sign in with their own email and password. It does not count as one of their devices, it has no PIN, and it signs out by itself after 15 minutes of no use.'
+    : 'For the ICU computer that many doctors use. Doctors still sign in with their own email and password, but this computer does not count as one of their 2 devices, has no PIN, and signs out by itself after 15 minutes of no use. Turn this on only on that computer.'}</p>
+    <button class="btn ${on ? '' : 'primary'}" data-action="station-toggle">${on ? 'Stop using as a shared station' : 'Use this computer as a shared station'}</button></div>`;
+}
 
 /* =================================================================
    DEVICES (max 2 per person, admin unlimited)
@@ -2584,9 +2790,9 @@ function deviceName() {
 const maxDevices = () => +CFG.maxDevices || 2;
 const limitApplies = p => !!p && (p.role !== 'admin' || !!CFG.adminDeviceLimit);
 const deviceInList = p => !!(p && (p.devices || []).some(d => d.id === myDeviceId()));
-function deviceAllowed() { return !limitApplies(S.profile) || deviceInList(S.profile); }
+function deviceAllowed() { return isStation() || !limitApplies(S.profile) || deviceInList(S.profile); }
 async function registerDevice() {
-  const p = S.profile; if (!p || p.status !== 'approved') return;
+  const p = S.profile; if (!p || p.status !== 'approved' || isStation()) return;
   const list = (p.devices || []).slice(), me = myDeviceId(), now = Date.now();
   const i = list.findIndex(d => d.id === me);
   if (i >= 0) {
@@ -2997,7 +3203,7 @@ async function abxFromHandovers() {
   try {
     const sids = (p.sheets || []).slice().sort();
     const rows = [];
-    for (const sid of sids.slice(-40)) { const d = await S.store.getSheet(sid); const e = d && d.entries.find(x => x.id === p.id); if (e) rows.push({ sid, drugs: htmlToText(e.drugs) }); }
+    for (const sid of sids.slice(-40)) { const d = await S.store.getSheet(sid); const e = d && d.entries.find(x => x.id === p.id); if (e) rows.push({ sid, drugs: drugsText(e) }); }
     const body = r.querySelector('.modal-body'); if (!body) return;
     body.innerHTML = rows.length ? rows.map(x => `<div class="log-row"><span class="log-time">${esc(fmtSidShort(x.sid))}</span><div style="white-space:pre-line">${esc(x.drugs || '—')}</div></div>`).join('') : '<p class="help">This patient is not on any handover.</p>';
   } catch (e) { const body = r.querySelector('.modal-body'); if (body) body.innerHTML = `<p class="err">${esc(e.code || e.message)}</p>`; }
@@ -3335,7 +3541,7 @@ document.addEventListener('change', ev => {
   }
 });
 
-function deviceAllowedFor(p) { return !limitApplies(p) || deviceInList(p); }
+function deviceAllowedFor(p) { return isStation() || !limitApplies(p) || deviceInList(p); }
 
 /* ---------------- service worker ---------------- */
 function registerSW() {
